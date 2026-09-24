@@ -644,8 +644,9 @@ It mirrors [test projects](#test-projects): each listed benchcase is a
 `void <Suite>_<case>(bench_t *b)` function in `src/<Suite>.c`, bake generates
 stubs for cases that are missing together with the harness `main`, and
 `bake3 run bench/<name>` (or `bake3 bench <name>`) builds and runs it. Cases run
-sequentially in one process, because parallel cases would disturb each other's
-measurements.
+sequentially, because parallel cases would disturb each other's measurements,
+and every case runs in its own process, so a case that crashes or hangs only
+takes down that case and the run continues with the next one.
 
 ```json
 {
@@ -755,12 +756,46 @@ Arguments after `--` go to the benchmark binary:
 - `--threshold <frac>`: relative change that counts as a regression or an
   improvement (default 0.05).
 - `--timeout <sec>`: wall-clock limit for a single case, including its `setup`
-  and `teardown` (default 600, `0` disables it). A case that exceeds it prints
-  `TIMEOUT <Suite>.<case>` and ends the run with a non-zero exit code; because
-  benchcases share one process, the run cannot continue past a hung case.
+  and `teardown` (default 600, `0` disables it). A case that exceeds it is
+  killed and prints `TIMEOUT <Suite>.<case>`; the run continues with the next
+  case and exits with a non-zero code.
+- `--in-process`: run every case in the harness process instead of in a process
+  of its own, for example to attach a debugger or profiler to the whole run. A
+  crash then ends the run, and so does a timeout.
 - `--fail-on-regression`: exit non-zero when a case regressed beyond the
   threshold. Without it a regression is reported but the exit code stays 0.
 - `--list-benches`, `--list-suites`: print what the binary contains.
+
+### Crashes and timeouts
+The harness starts one process per case: it runs the benchmark binary again
+with the name of the case and an internal `--bench-child <file>` argument. That
+process measures the case and writes its samples to the file; the harness reads
+them back, computes the statistics and prints the line for the case. What a
+case prints itself appears above its line.
+
+A case that does not produce a result is reported on its own line and the run
+goes on:
+
+```
+Alpha.add                              0.312 ns/iter  ci95 [0.311, 0.313]  iters 32051282  samples 100  outliers 3
+CRASH Alpha.boom (signal 11: Segmentation fault: 11)
+TIMEOUT Alpha.hang (exceeded 600 seconds)
+ERROR Alpha.empty (exit code 1)
+Alpha.mul                              0.624 ns/iter  ci95 [0.622, 0.626]  iters 16025641  samples 100  outliers 1
+-----------------------------
+core: 2 benchmark(s) in 603.113s
+3 benchmark(s) failed:
+FAILED Alpha.boom (crash)
+FAILED Alpha.hang (timeout)
+FAILED Alpha.empty (error)
+```
+
+- `CRASH`: the process was ended by a signal (an exception code on Windows).
+- `TIMEOUT`: the case exceeded `--timeout` and was killed.
+- `ERROR`: the process exited with a non-zero code or without a result, for
+  example because the case never called `bench_iter`.
+
+Any failed case makes the run exit with a non-zero code.
 
 A baseline comparison adds the relative change to each line and lists the
 regressions at the end:
@@ -787,12 +822,15 @@ same field style as the test report:
   "samples": 100,
   "time_budget_sec": 1.0,
   "sample_target_sec": 0.01,
+  "isolation": "process",
   "cases": 1,
+  "failed": 1,
   "time_sec": 1.204,
   "benchmarks": [
     {
       "suite": "Entity",
       "case": "new",
+      "status": "ok",
       "iterations": 397000,
       "samples": 100,
       "total_iterations": 39700000,
@@ -807,12 +845,22 @@ same field style as the test report:
       "counters": [{"name": "entities", "total": 39700000.0, "per_iter": 1.0}],
       "sample_ns": [25.31, 25.28, 25.44]
     }
+  ],
+  "failures": [
+    {"suite": "Entity", "case": "delete", "status": "crash", "signal": 11, "time_sec": 0.052}
   ]
 }
 ```
 
 `items_per_sec` is only written when `bench_set_items` was called, and
 `baseline_median_ns` and `change` are added per case when `--baseline` is used.
+
+`benchmarks` holds the cases that produced a result, with `status` `ok`, and
+`cases` counts them. `failures` holds the cases that did not, and `failed`
+counts them. A failure has a `status` of `crash`, `timeout` or `error`, the
+`signal` that ended the process (POSIX crashes) or its `exit_code` when it is not
+zero, and the wall-clock `time_sec` the case took until it ended. `isolation` is
+`process`, or `none` for a run with `--in-process`.
 
 ## Build reports
 `--build-json <file>` writes one json document that describes the build bake

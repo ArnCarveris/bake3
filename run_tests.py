@@ -2422,7 +2422,7 @@ class BakeTests(unittest.TestCase):
                     "id": project_id,
                     "type": "application",
                     "bench": {
-                        "benchsuites": [{"id": "Alpha", "benchcases": ["hang"]}]
+                        "benchsuites": [{"id": "Alpha", "benchcases": ["hang", "after"]}]
                     },
                 },
                 indent=4,
@@ -2438,16 +2438,123 @@ class BakeTests(unittest.TestCase):
             "#define case_sleep(sec) sleep(sec)\n"
             "#endif\n"
             "void Alpha_hang(bench_t *b) { (void)b; case_sleep(300); }\n"
+            "void Alpha_after(bench_t *b) {\n"
+            "    int x = 0;\n"
+            "    while (bench_iter(b)) { x += 1; bench_keep(x); }\n"
+            "}\n"
         )
 
+        report = project_dir / "report.json"
         start = time.monotonic()
         output = self.strip_ansi(self.bake_expect_failure(
-            ["--local-env=bench_timeout", "run", ".", "--", "--timeout", "2"],
+            ["--local-env=bench_timeout", "run", ".", "--", "--timeout", "2",
+             "--time", "0.1", "--samples", "3", "--sample-time", "0.001",
+             "--json", str(report)],
             cwd=project_dir))
         elapsed = time.monotonic() - start
 
         self.assertIn("TIMEOUT Alpha.hang (exceeded 2 seconds)", output)
+        self.assertRegex(output, r"(?m)^Alpha\.after\s+\S+ ns/iter")
+        self.assertIn("FAILED Alpha.hang (timeout)", output)
         self.assertLess(elapsed, 60.0, f"bench run took {elapsed:.1f}s")
+
+        data = json.loads(report.read_text())
+        self.assertEqual([b["case"] for b in data["benchmarks"]], ["after"])
+        self.assertEqual(data["failed"], 1)
+        self.assertEqual(data["failures"][0]["case"], "hang")
+        self.assertEqual(data["failures"][0]["status"], "timeout")
+
+    def test_bench_harness_isolates_crashing_cases(self) -> None:
+        stamp = int(time.time() * 1_000_000)
+        project_id = f"tmp.bench.crash.{stamp}"
+        project_dir = self.repo_root / "test" / "tmp" / f"bench_crash_{stamp}"
+        self.addCleanup(shutil.rmtree, project_dir, ignore_errors=True)
+        self.bench_project_files(project_dir, project_id, ["add", "boom", "nosamples", "mul"])
+        with (project_dir / "src" / "Alpha.c").open("a") as f:
+            f.write(
+                "\n"
+                "#include <stdio.h>\n"
+                "void Alpha_boom(bench_t *b) {\n"
+                "    volatile int *ptr = NULL;\n"
+                "    (void)b;\n"
+                "    printf(\"about to crash\\n\");\n"
+                "    fflush(stdout);\n"
+                "    *ptr = 1;\n"
+                "}\n"
+                "\n"
+                "void Alpha_nosamples(bench_t *b) { (void)b; }\n"
+            )
+
+        report = project_dir / "report.json"
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["--local-env=bench_crash", "run", ".", "--",
+             "--time", "0.1", "--samples", "3", "--sample-time", "0.001",
+             "--json", str(report)],
+            cwd=project_dir))
+
+        self.assertIn("about to crash", output)
+        self.assertIn("CRASH Alpha.boom", output)
+        self.assertIn("ERROR Alpha.nosamples (exit code 1)", output)
+        self.assertRegex(output, r"(?m)^Alpha\.add\s+\S+ ns/iter")
+        self.assertRegex(output, r"(?m)^Alpha\.mul\s+\S+ ns/iter")
+        self.assertIn("2 benchmark(s) failed:", output)
+        self.assertIn("FAILED Alpha.boom (crash)", output)
+        self.assertIn("FAILED Alpha.nosamples (error)", output)
+        self.assertLess(output.index("Alpha.add "), output.index("CRASH Alpha.boom"))
+        self.assertLess(output.index("CRASH Alpha.boom"), output.index("Alpha.mul "))
+
+        data = json.loads(report.read_text())
+        self.assertEqual(data["isolation"], "process")
+        self.assertEqual(data["cases"], 2)
+        self.assertEqual(data["failed"], 2)
+        by_case = {b["case"]: b for b in data["benchmarks"]}
+        self.assertEqual(set(by_case), {"add", "mul"})
+        for case in by_case.values():
+            self.assertEqual(case["status"], "ok")
+            self.assertEqual(len(case["sample_ns"]), case["samples"])
+        self.assertEqual(by_case["add"]["items_per_iter"], 2)
+        counters = {c["name"]: c for c in by_case["add"]["counters"]}
+        self.assertAlmostEqual(counters["adds"]["per_iter"], 1.0, places=3)
+
+        failures = {f["case"]: f for f in data["failures"]}
+        self.assertEqual(set(failures), {"boom", "nosamples"})
+        self.assertEqual(failures["boom"]["status"], "crash")
+        if platform.system() != "Windows":
+            self.assertIn(failures["boom"]["signal"], {signal.SIGSEGV, signal.SIGBUS})
+        self.assertEqual(failures["nosamples"]["status"], "error")
+        self.assertEqual(failures["nosamples"]["exit_code"], 1)
+
+        single = project_dir / "single.json"
+        self.bake_expect_failure(
+            ["--local-env=bench_crash", "run", ".", "--", "Alpha.boom",
+             "--time", "0.1", "--samples", "3", "--sample-time", "0.001",
+             "--json", str(single)],
+            cwd=project_dir)
+        data = json.loads(single.read_text())
+        self.assertEqual(data["benchmarks"], [])
+        self.assertEqual([f["case"] for f in data["failures"]], ["boom"])
+
+    def test_bench_harness_runs_in_process(self) -> None:
+        stamp = int(time.time() * 1_000_000)
+        project_id = f"tmp.bench.inproc.{stamp}"
+        project_dir = self.repo_root / "test" / "tmp" / f"bench_inproc_{stamp}"
+        self.addCleanup(shutil.rmtree, project_dir, ignore_errors=True)
+        self.bench_project_files(project_dir, project_id, ["add", "mul"])
+
+        report = project_dir / "report.json"
+        output = self.strip_ansi(self.bake(
+            ["--local-env=bench_inproc", "run", ".", "--", "--in-process",
+             "--time", "0.1", "--samples", "3", "--sample-time", "0.001",
+             "--json", str(report)],
+            cwd=project_dir))
+        self.assertIn("Alpha.add", output)
+        self.assertIn("Alpha.mul", output)
+
+        data = json.loads(report.read_text())
+        self.assertEqual(data["isolation"], "none")
+        self.assertEqual(data["failed"], 0)
+        self.assertEqual(data["failures"], [])
+        self.assertEqual({b["case"] for b in data["benchmarks"]}, {"add", "mul"})
 
     def test_bench_project_runs_cases_and_writes_json_report(self) -> None:
         stamp = int(time.time() * 1_000_000)
