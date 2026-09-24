@@ -2959,6 +2959,44 @@ class BakeTests(unittest.TestCase):
         self.assertEqual(workspace_loc["code"], project_loc["code"])
         self.assertEqual(workspace_loc["by_language"], project_loc["by_language"])
 
+    def test_build_json_reports_lines_of_code_per_file(self) -> None:
+        project_dir, app_id = self.write_build_json_app("build_json_loc_by_file")
+        (project_dir / "include" / "sub").mkdir(parents=True)
+        (project_dir / "include" / "helper.h").write_text(
+            "// helper api\n#ifndef HELPER_H\n#define HELPER_H\n\n"
+            "int helper(void);\n\n#endif\n")
+        (project_dir / "include" / "sub" / "detail.h").write_text(
+            "#define DETAIL 1\n")
+        report_path = project_dir / "build.json"
+
+        self.bake(["build", str(project_dir), "--build-json", str(report_path)])
+
+        report = json.loads(report_path.read_text())
+        self.assertTrue(report["ok"])
+
+        project_loc = report["totals"]["project"][app_id]["loc"]
+        by_file = project_loc["by_file"]
+        self.assertEqual(
+            sorted(by_file),
+            ["include/helper.h", "include/sub/detail.h", "src/helper.c", "src/main.c"])
+        self.assertEqual(
+            by_file["include/helper.h"],
+            {"language": "C/C++ Header", "code": 4, "comment": 1, "blank": 2})
+        self.assertEqual(
+            by_file["include/sub/detail.h"],
+            {"language": "C/C++ Header", "code": 1, "comment": 0, "blank": 0})
+        self.assertEqual(by_file["src/helper.c"]["language"], "C")
+        self.assertEqual(by_file["src/helper.c"]["code"], 1)
+
+        self.assertEqual(project_loc["files"], len(by_file))
+        for field in ("code", "comment", "blank"):
+            self.assertEqual(
+                project_loc[field], sum(entry[field] for entry in by_file.values()))
+        self.assertEqual(project_loc["by_language"]["C/C++ Header"]["files"], 2)
+        self.assertEqual(project_loc["by_language"]["C"]["files"], 2)
+
+        self.assertNotIn("by_file", report["totals"]["loc"])
+
     def test_build_json_reports_a_note_when_cloc_is_unavailable(self) -> None:
         project_dir, app_id = self.write_build_json_app("build_json_loc_missing")
         report_path = project_dir / "build.json"

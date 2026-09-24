@@ -52,7 +52,8 @@ void bake_report_set_loc(
     int32_t code,
     int32_t comment,
     int32_t blank,
-    const char *by_language_json);
+    const char *by_language_json,
+    const char *by_file_json);
 
 void bake_report_set_workspace_loc(
     bake_build_report_t *report,

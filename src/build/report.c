@@ -23,6 +23,7 @@ typedef struct bake_report_step_t {
     int32_t loc_comment;
     int32_t loc_blank;
     char *loc_by_language;
+    char *loc_by_file;
 } bake_report_step_t;
 
 struct bake_build_report_t {
@@ -66,6 +67,7 @@ typedef struct bake_report_project_total_t {
     int32_t loc_comment;
     int32_t loc_blank;
     const char *loc_by_language;
+    const char *loc_by_file;
 } bake_report_project_total_t;
 
 static double bake_report_round(double value) {
@@ -215,6 +217,7 @@ void bake_report_free(bake_build_report_t *report) {
         ecs_os_free(step->object);
         ecs_os_free(step->error);
         ecs_os_free(step->loc_by_language);
+        ecs_os_free(step->loc_by_file);
     }
 
     if (report->lock) {
@@ -346,7 +349,8 @@ void bake_report_set_loc(
     int32_t code,
     int32_t comment,
     int32_t blank,
-    const char *by_language_json)
+    const char *by_language_json,
+    const char *by_file_json)
 {
     if (!report || step < 0 || step >= report->count) {
         return;
@@ -361,6 +365,8 @@ void bake_report_set_loc(
     entry->loc_blank = blank;
     ecs_os_free(entry->loc_by_language);
     entry->loc_by_language = ecs_os_strdup(by_language_json ? by_language_json : "{}");
+    ecs_os_free(entry->loc_by_file);
+    entry->loc_by_file = by_file_json ? ecs_os_strdup(by_file_json) : NULL;
     ecs_os_mutex_unlock(report->lock);
 }
 
@@ -588,12 +594,17 @@ static void bake_report_append_loc_value(
     int32_t code,
     int32_t comment,
     int32_t blank,
-    const char *by_language_json)
+    const char *by_language_json,
+    const char *by_file_json)
 {
     ecs_strbuf_append(buf, "{\"files\": %d, \"code\": %d, \"comment\": %d, "
         "\"blank\": %d, \"by_language\": ", files, code, comment, blank);
     ecs_strbuf_appendstr(buf,
         (by_language_json && by_language_json[0]) ? by_language_json : "{}");
+    if (by_file_json && by_file_json[0]) {
+        ecs_strbuf_appendstr(buf, ", \"by_file\": ");
+        ecs_strbuf_appendstr(buf, by_file_json);
+    }
     ecs_strbuf_appendstr(buf, "}");
 }
 
@@ -631,6 +642,7 @@ static void bake_report_append_project_totals(
                 entry->loc_comment = step->loc_comment;
                 entry->loc_blank = step->loc_blank;
                 entry->loc_by_language = step->loc_by_language;
+                entry->loc_by_file = step->loc_by_file;
             }
 
             continue;
@@ -669,7 +681,8 @@ static void bake_report_append_project_totals(
         if (entry->has_loc) {
             ecs_strbuf_appendstr(buf, ", \"loc\": ");
             bake_report_append_loc_value(buf, entry->loc_files, entry->loc_code,
-                entry->loc_comment, entry->loc_blank, entry->loc_by_language);
+                entry->loc_comment, entry->loc_blank, entry->loc_by_language,
+                entry->loc_by_file);
         }
         ecs_strbuf_appendstr(buf, "}");
     }
@@ -691,7 +704,7 @@ static void bake_report_append_workspace_loc(
         bake_report_append_loc_value(buf,
             report->workspace_loc_files, report->workspace_loc_code,
             report->workspace_loc_comment, report->workspace_loc_blank,
-            report->workspace_loc_by_language);
+            report->workspace_loc_by_language, NULL);
     } else if (report->loc_note) {
         ecs_strbuf_appendstr(buf, "{\"note\": ");
         bake_report_append_string(buf, report->loc_note);
