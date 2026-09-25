@@ -8,7 +8,8 @@ static const char *bake_env_required_test_templates[] = {
     "bake_test_runtime.h",
     "bake_test_runtime.c",
     "bake_bench.h",
-    "bake_bench.c"
+    "bake_bench.c",
+    "coverage_report.html"
 };
 
 bool bake_env_has_required_test_templates(const char *dir, const char **missing_out) {

@@ -1,4 +1,5 @@
 #include "bake/bench_harness.h"
+#include "bake/build.h"
 #include "bake/os.h"
 #include "bake/ps.h"
 
@@ -116,6 +117,10 @@ int bake_bench_run_project(
     const bake_project_cfg_t *cfg,
     const char *exe_path)
 {
+    if (ctx && bake_coverage_export_env(ctx, cfg) != 0) {
+        return -1;
+    }
+
     ecs_strbuf_t cmd = ECS_STRBUF_INIT;
     if (ctx && ctx->opts.run_prefix) {
         ecs_strbuf_append(&cmd, "%s ", ctx->opts.run_prefix);

@@ -1,4 +1,5 @@
 #include "bake/test_harness.h"
+#include "bake/build.h"
 #include "bake/os.h"
 #include "bake/ps.h"
 
@@ -80,13 +81,73 @@ cleanup:
     return rc;
 }
 
+static char* bake_test_coverage_source(
+    const bake_context_t *ctx,
+    const bake_project_cfg_t *cfg,
+    const char *tmpl_src)
+{
+    char *content = bake_file_read(tmpl_src, NULL);
+    char *dir = bake_coverage_dir(cfg, ctx->opts.mode);
+    char *build_root = bake_project_build_root(cfg->path, cfg->id, ctx->opts.mode);
+    char *project_dir = bake_path_resolve(cfg->path);
+    char *result = NULL;
+
+    if (!content || !dir || !build_root || bake_os_mkdirs(dir) != 0) {
+        goto cleanup;
+    }
+
+    ecs_strbuf_t buf = ECS_STRBUF_INIT;
+    ecs_strbuf_appendstr(&buf, "#define BAKE_TEST_COVERAGE_DIR ");
+    bake_append_c_literal(&buf, dir);
+    ecs_strbuf_appendstr(&buf, "\n#define BAKE_TEST_COVERAGE_PROFDATA ");
+    bake_append_c_literal(&buf, ctx->coverage_profdata);
+    ecs_strbuf_appendstr(&buf, "\n#define BAKE_TEST_COVERAGE_COV ");
+    bake_append_c_literal(&buf, ctx->coverage_cov);
+    ecs_strbuf_appendstr(&buf, "\n#define BAKE_TEST_COVERAGE_EXCLUDE {");
+    bake_append_c_literal(&buf, cfg->path);
+    ecs_strbuf_appendstr(&buf, ", ");
+    bake_append_c_literal(&buf, project_dir ? project_dir : cfg->path);
+    ecs_strbuf_appendstr(&buf, ", ");
+    bake_append_c_literal(&buf, build_root);
+    ecs_strbuf_appendstr(&buf, ", NULL}\n");
+    ecs_strbuf_appendstr(&buf, content);
+    result = ecs_strbuf_get(&buf);
+
+cleanup:
+    ecs_os_free(content);
+    ecs_os_free(dir);
+    ecs_os_free(build_root);
+    ecs_os_free(project_dir);
+    return result;
+}
+
+static int bake_test_write_source(
+    const bake_context_t *ctx,
+    const bake_project_cfg_t *cfg,
+    const char *tmpl_src,
+    const char *src_path)
+{
+    if (!ctx->opts.coverage) {
+        return bake_os_file_copy(tmpl_src, src_path);
+    }
+
+    char *content = bake_test_coverage_source(ctx, cfg, tmpl_src);
+    if (!content) {
+        ecs_err("failed to generate coverage harness for %s", cfg->id);
+        return -1;
+    }
+
+    int rc = bake_file_write(src_path, content);
+    ecs_os_free(content);
+    return rc;
+}
+
 int bake_test_generate_builtin_api(
     bake_context_t *ctx,
     const bake_project_cfg_t *cfg,
     const char *gen_dir,
     char **src_out)
 {
-    BAKE_UNUSED(cfg);
     if (!gen_dir || !src_out) return -1;
 
     int rc = -1;
@@ -97,7 +158,7 @@ int bake_test_generate_builtin_api(
 
     if (tmpl_hdr && tmpl_src &&
         bake_os_file_copy(tmpl_hdr, hdr_path) == 0 &&
-        bake_os_file_copy(tmpl_src, src_path) == 0)
+        bake_test_write_source(ctx, cfg, tmpl_src, src_path) == 0)
     {
         *src_out = src_path;
         src_path = NULL;
@@ -122,6 +183,11 @@ int bake_test_run_project(bake_context_t *ctx, const bake_project_cfg_t *cfg, co
         char jobs_str[32];
         ecs_os_snprintf(jobs_str, sizeof(jobs_str), "%d", ctx->opts.jobs);
         bake_os_setenv("BAKE_TEST_THREADS", jobs_str);
+    }
+
+    if (ctx && bake_coverage_export_env(ctx, cfg) != 0) {
+        ecs_os_free(old_threads);
+        return -1;
     }
 
     ecs_strbuf_t cmd = ECS_STRBUF_INIT;

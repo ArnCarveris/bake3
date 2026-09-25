@@ -5,6 +5,7 @@
 static const char *bake_local_env_reserved[] = {
     "bin",
     "build",
+    "coverage_report",
     "etc",
     "include",
     "lib",

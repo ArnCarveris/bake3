@@ -2136,6 +2136,145 @@ class BakeTests(unittest.TestCase):
                 self.assertEqual(t["suite"], "Alpha")
                 self.assertGreater(t["elapsed"], 0.0)
 
+    def test_test_harness_writes_coverage_report(self) -> None:
+        if platform.system() == "Windows":
+            self.skipTest("coverage is not supported on Windows")
+        compiler = shutil.which("cc")
+        if not compiler:
+            self.skipTest("no C compiler available")
+        version = subprocess.run(
+            [compiler, "--version"], text=True, capture_output=True, check=False)
+        if "clang" not in (version.stdout or ""):
+            self.skipTest("coverage requires clang")
+
+        stamp = int(time.time() * 1_000_000)
+        lib_id = f"tmp.tests.coverage.lib.{stamp}"
+        test_id = f"tmp.tests.coverage.test.{stamp}"
+        root = self.repo_root / "test" / "tmp" / f"harness_coverage_{stamp}"
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        lib_dir = root / "lib"
+        test_dir = root / "test"
+        (lib_dir / "src").mkdir(parents=True, exist_ok=True)
+        (lib_dir / "include").mkdir(parents=True, exist_ok=True)
+        (test_dir / "src").mkdir(parents=True, exist_ok=True)
+
+        (lib_dir / "project.json").write_text(
+            json.dumps({"id": lib_id, "type": "package"}, indent=4) + "\n")
+        (lib_dir / "include" / "covlib.h").write_text(
+            "int covlib_sign(int x);\n"
+            "int covlib_unused(void);\n"
+        )
+        (lib_dir / "src" / "covlib.c").write_text(
+            "#include <covlib.h>\n"
+            "int covlib_sign(int x) {\n"
+            "    if (x > 0) {\n"
+            "        return 1;\n"
+            "    }\n"
+            "    return -1;\n"
+            "}\n"
+            "int covlib_unused(void) {\n"
+            "    return 42;\n"
+            "}\n"
+        )
+        (test_dir / "project.json").write_text(
+            json.dumps(
+                {
+                    "id": test_id,
+                    "type": "test",
+                    "value": {"use": [lib_id]},
+                    "test": {
+                        "testsuites": [
+                            {"id": "Sign", "testcases": ["pos", "neg"]},
+                        ]
+                    },
+                },
+                indent=4,
+            ) + "\n"
+        )
+        (test_dir / "src" / "Sign.c").write_text(
+            "#include <bake_test.h>\n"
+            "#include <covlib.h>\n"
+            "void Sign_pos(void) { test_int(covlib_sign(3), 1); }\n"
+            "void Sign_neg(void) { test_int(covlib_sign(-3), -1); }\n"
+        )
+
+        local_env = "--local-env=coverage"
+        report = root / "report.json"
+        coverage = root / "report.coverage.json"
+        for jobs in ("1", "2"):
+            output = self.bake(
+                [local_env, "run", "test", "--coverage", "--",
+                 "-j", jobs, "--json", str(report)],
+                cwd=root)
+            self.assertIn("coverage: ", output)
+            self.assertTrue(coverage.is_file(), f"missing report {coverage}")
+            data = json.loads(coverage.read_text())
+            self.assertEqual(data["project"], test_id)
+            files = {Path(f["file"]).name: f for f in data["files"]}
+            self.assertEqual(set(files), {"covlib.c"})
+            lib = files["covlib.c"]
+            self.assertEqual(lib["functions"]["count"], 2)
+            self.assertEqual(lib["functions"]["covered"], 1)
+            self.assertEqual(
+                [f["name"] for f in lib["uncovered_functions"]],
+                ["covlib_unused"])
+            self.assertEqual(lib["uncovered_lines"], [[8, 10]])
+            self.assertEqual(data["lines"], lib["lines"])
+            self.assertEqual(data["lines"]["covered"], 6)
+
+        self.assertEqual(list(test_dir.glob("*.profraw")), [])
+        env_root = root / ".bake" / "local_env" / "coverage" / "build"
+        self.assertTrue(list(env_root.glob("**/coverage/*.profraw")))
+
+        output = self.bake([local_env, "coverage-report"], cwd=root)
+        self.assertIn(f"coverage of 1 test project: {test_id}", output)
+        self.assertRegex(output, r"lib/src\s+66\.67%\s+6/9")
+        self.assertRegex(output, r"total\s+66\.67%\s+6/9\s+50\.00%\s+1/2")
+        report_dir = root / ".bake" / "local_env" / "coverage" / "coverage_report"
+        self.assertIn(str(report_dir / "index.html"), output)
+        index = (report_dir / "index.html").read_text()
+        self.assertNotIn("/*BAKE_COVERAGE_DATA*/", index)
+        self.assertIn('"files": [\n["lib/src/covlib.c",[6,9],[1,2],', index)
+        file_data = (report_dir / "files" / "0.js").read_text()
+        self.assertTrue(file_data.startswith("bakeCoverageFile(0, {"))
+        self.assertIn('"covlib_unused",8,0', file_data)
+        self.assertIn("[9,0]", file_data)
+        combined = json.loads((report_dir / "coverage.json").read_text())
+        self.assertEqual(combined["projects"], [test_id])
+        self.assertEqual(combined["lines"], data["lines"])
+        self.assertEqual(combined["files"][0]["uncovered_lines"], [[8, 10]])
+
+        self.bake([local_env, "clean", "test"], cwd=root)
+        self.assertEqual(list(env_root.glob("**/coverage/*")), [])
+        self.assertFalse(report_dir.exists())
+
+        output = self.bake_expect_failure([local_env, "coverage-report"], cwd=root)
+        self.assertIn("no coverage data found", output)
+
+        coverage.unlink()
+        self.bake([local_env, "run", "test", "--", "--json", str(report)],
+            cwd=root)
+        self.assertFalse(coverage.exists())
+
+    def test_coverage_requires_clang(self) -> None:
+        if platform.system() == "Windows":
+            self.skipTest("coverage is not supported on Windows")
+        stamp = int(time.time() * 1_000_000)
+        fake_dir = self.repo_root / "test" / "tmp" / f"fake_gcc_{stamp}"
+        self.addCleanup(shutil.rmtree, fake_dir, ignore_errors=True)
+        fake_dir.mkdir(parents=True, exist_ok=True)
+        fake_gcc = fake_dir / "gcc"
+        fake_gcc.write_text("#!/bin/sh\necho 'gcc (GCC) 14.2.0'\n")
+        fake_gcc.chmod(0o755)
+
+        output = self.bake_expect_failure(
+            ["build", "test/projects/c/app_helloworld", "--coverage",
+             "--cc", str(fake_gcc)])
+        self.assertIn("--coverage requires clang", output)
+
+        output = self.bake_expect_failure(["clean", "--coverage"])
+        self.assertIn("--coverage can only be used with", output)
+
     def timeout_project_files(self, project_dir: Path, project_id: str) -> None:
         """Write a test project with a hung case, a slow case and a quiet case."""
         src_dir = project_dir / "src"

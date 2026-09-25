@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coverage report</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  --bg: #ffffff;
+  --bg-soft: #f6f7f9;
+  --bg-sunk: #eef0f3;
+  --fg: #1d2127;
+  --fg-muted: #5f6873;
+  --fg-faint: #8b939c;
+  --border: #dde1e6;
+  --accent: #2f6fdd;
+  --good: #1f8a4c;
+  --warn: #b7791f;
+  --bad: #c9372c;
+  --line-hit: #e6f4ea;
+  --line-miss: #fbe9e7;
+  --line-partial: #fdf3dc;
+  --gutter-hit: #b8e0c4;
+  --gutter-miss: #f3c1bb;
+  --gutter-partial: #f2d898;
+  --select: #fff5b8;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15181c;
+    --bg-soft: #1b1f24;
+    --bg-sunk: #22272e;
+    --fg: #e3e6ea;
+    --fg-muted: #9aa3ad;
+    --fg-faint: #6c757f;
+    --border: #2d333b;
+    --accent: #6ea2ff;
+    --good: #4cc27d;
+    --warn: #e0a84a;
+    --bad: #f0706a;
+    --line-hit: #16291f;
+    --line-miss: #33191a;
+    --line-partial: #332a14;
+    --gutter-hit: #245236;
+    --gutter-miss: #5e2825;
+    --gutter-partial: #5c4a1d;
+    --select: #4a4219;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.45 var(--sans);
+  display: flex;
+  flex-direction: column;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-soft);
+  flex-wrap: wrap;
+}
+header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+header h1 a { color: var(--fg); }
+header .meta { color: var(--fg-muted); font-size: 12px; }
+header .totals { margin-left: auto; display: flex; gap: 14px; flex-wrap: wrap; }
+.pill { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--fg-muted); }
+.pill b { color: var(--fg); font-variant-numeric: tabular-nums; }
+#menu { display: none; background: none; border: 1px solid var(--border); color: var(--fg); border-radius: 6px; padding: 4px 8px; cursor: pointer; }
+.layout { flex: 1; display: flex; min-height: 0; }
+aside {
+  width: 340px;
+  min-width: 240px;
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-soft);
+}
+.controls { padding: 10px; display: flex; flex-direction: column; gap: 8px; border-bottom: 1px solid var(--border); }
+.controls input[type=search] {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+}
+.controls .row { display: flex; gap: 10px; align-items: center; font-size: 12px; color: var(--fg-muted); }
+.controls select { background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; font: inherit; padding: 2px 4px; }
+#tree { overflow: auto; flex: 1; padding: 4px 0 16px; font-size: 13px; }
+.node { display: flex; align-items: center; gap: 6px; padding: 2px 10px; cursor: pointer; white-space: nowrap; }
+.node:hover { background: var(--bg-sunk); }
+.node.active { background: var(--bg-sunk); box-shadow: inset 3px 0 0 var(--accent); }
+.node .name { overflow: hidden; text-overflow: ellipsis; flex: 1; }
+.node.dir .name { font-weight: 600; }
+.node .dim { color: var(--fg-faint); margin-left: 6px; }
+.node .twisty { width: 12px; color: var(--fg-faint); font-size: 10px; flex: none; text-align: center; }
+.node .pct { font-variant-numeric: tabular-nums; font-size: 12px; width: 52px; text-align: right; flex: none; }
+.bar { width: 48px; height: 6px; border-radius: 3px; background: var(--bg-sunk); overflow: hidden; flex: none; }
+.bar > span { display: block; height: 100%; }
+.good { color: var(--good); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+.bg-good { background: var(--good); } .bg-warn { background: var(--warn); } .bg-bad { background: var(--bad); }
+main { flex: 1; overflow: auto; min-width: 0; }
+.page { padding: 20px 24px 40px; max-width: 1200px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin: 12px 0 24px; }
+.card { border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; background: var(--bg-soft); }
+.card .label { font-size: 12px; color: var(--fg-muted); text-transform: uppercase; letter-spacing: .04em; }
+.card .value { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.card .sub { font-size: 12px; color: var(--fg-muted); font-variant-numeric: tabular-nums; }
+.card .bar { width: 100%; height: 6px; margin-top: 8px; }
+h2 { font-size: 15px; margin: 24px 0 8px; }
+.tablewrap { overflow-x: auto; }
+table.grid { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.grid th, table.grid td { padding: 5px 8px; border-bottom: 1px solid var(--border); text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+table.grid th:first-child, table.grid td:first-child { text-align: left; white-space: normal; word-break: break-all; min-width: 200px; }
+table.grid th { font-weight: 600; color: var(--fg-muted); cursor: pointer; user-select: none; position: sticky; top: 0; background: var(--bg); }
+table.grid th.sorted::after { content: " \25BE"; }
+table.grid th.sorted.asc::after { content: " \25B4"; }
+table.grid tr:hover td { background: var(--bg-soft); }
+table.grid td .cell { display: inline-flex; align-items: center; gap: 8px; justify-content: flex-end; }
+table.grid td .count { color: var(--fg-faint); font-size: 12px; min-width: 90px; }
+.filehead { position: sticky; top: 0; background: var(--bg); border-bottom: 1px solid var(--border); padding: 12px 24px; z-index: 2; }
+.crumbs { font-family: var(--mono); font-size: 13px; word-break: break-all; }
+.crumbs a { color: var(--fg-muted); }
+.filestats { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 6px; align-items: center; }
+.nav { margin-left: auto; display: flex; gap: 6px; align-items: center; font-size: 12px; color: var(--fg-muted); }
+button.btn { background: var(--bg-soft); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 10px; font: inherit; font-size: 12px; cursor: pointer; }
+button.btn:hover { background: var(--bg-sunk); }
+.fns { padding: 10px 24px 0; font-size: 12px; }
+.fns summary { cursor: pointer; color: var(--fg-muted); }
+.fnlist { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 4px; }
+.fnlist a { font-family: var(--mono); background: var(--line-miss); color: var(--fg); padding: 1px 6px; border-radius: 4px; }
+.legend { display: flex; gap: 12px; font-size: 12px; color: var(--fg-muted); align-items: center; }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+.source { font-family: var(--mono); font-size: 12.5px; line-height: 1.5; margin: 12px 0 40px; min-width: max-content; }
+.ln { display: flex; }
+.ln > * { padding: 0 8px; }
+.ln .no { width: 64px; flex: none; text-align: right; color: var(--fg-faint); user-select: none; border-right: 3px solid transparent; }
+.ln .no a { color: inherit; }
+.ln .hits { width: 64px; flex: none; text-align: right; color: var(--fg-muted); user-select: none; font-variant-numeric: tabular-nums; }
+.ln .br { width: 44px; flex: none; text-align: center; color: var(--warn); user-select: none; font-size: 11px; }
+.ln .code { white-space: pre; flex: 1; tab-size: 4; }
+.ln.hit { background: var(--line-hit); } .ln.hit .no { border-right-color: var(--gutter-hit); }
+.ln.miss { background: var(--line-miss); } .ln.miss .no { border-right-color: var(--gutter-miss); } .ln.miss .hits { color: var(--bad); font-weight: 600; }
+.ln.partial { background: var(--line-partial); } .ln.partial .no { border-right-color: var(--gutter-partial); }
+.ln.target { background: var(--select) !important; }
+.empty { color: var(--fg-muted); padding: 40px 24px; }
+.hint { color: var(--fg-faint); font-size: 12px; }
+kbd { font-family: var(--mono); font-size: 11px; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; background: var(--bg-soft); }
+@media (max-width: 800px) {
+  #menu { display: inline-block; }
+  aside { position: fixed; top: 0; bottom: 0; left: 0; z-index: 10; width: 86vw; transform: translateX(-100%); transition: transform .15s; }
+  body.menu-open aside { transform: none; }
+  header .totals { margin-left: 0; }
+  .page, .filehead, .fns { padding-left: 16px; padding-right: 16px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <button id="menu" aria-label="Files">&#9776;</button>
+  <h1><a href="#">Coverage &middot; <span id="title"></span></a></h1>
+  <span class="meta" id="meta"></span>
+  <div class="totals" id="totals"></div>
+</header>
+<div class="layout">
+  <aside>
+    <div class="controls">
+      <input type="search" id="filter" placeholder="Filter files" autocomplete="off">
+      <div class="row">
+        <label><input type="checkbox" id="uncovered"> Only files with uncovered lines</label>
+      </div>
+      <div class="row">
+        Sort
+        <select id="sort">
+          <option value="name">name</option>
+          <option value="low">lowest coverage</option>
+          <option value="missed">most uncovered lines</option>
+        </select>
+      </div>
+    </div>
+    <div id="tree"></div>
+  </aside>
+  <main id="main"></main>
+</div>
+<script>window.BAKE_COVERAGE = /*BAKE_COVERAGE_DATA*/null;</script>
+<script>
+(function() {
+  "use strict";
+  var data = window.BAKE_COVERAGE;
+  var main = document.getElementById("main");
+  var treeEl = document.getElementById("tree");
+  var filterEl = document.getElementById("filter");
+  var uncoveredEl = document.getElementById("uncovered");
+  var sortEl = document.getElementById("sort");
+  var loaded = {};
+  var pending = {};
+  var collapsed = {};
+  var tableSort = { key: "path", asc: true };
+  var current = { file: -1, misses: [], missPos: -1 };
+
+  var files = data.files.map(function(f, i) {
+    return { index: i, path: f[0], lines: f[1], functions: f[2], branches: f[3] };
+  });
+  var byPath = {};
+  files.forEach(function(f) { byPath[f.path] = f; });
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function(c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[c];
+    });
+  }
+  function pct(c) { return c[1] ? (c[0] * 100 / c[1]) : 100; }
+  function fmtPct(c) { return c[1] ? pct(c).toFixed(1) + "%" : "–"; }
+  function level(c) { var p = pct(c); return p >= 80 ? "good" : (p >= 50 ? "warn" : "bad"); }
+  function bar(c, wide) {
+    return '<div class="bar"' + (wide ? ' style="width:100%"' : '') + '><span class="bg-' + level(c) +
+      '" style="width:' + pct(c).toFixed(1) + '%"></span></div>';
+  }
+  function fmtNum(n) { return n.toLocaleString("en-US"); }
+  function fmtHits(n) {
+    if (n < 1000) return String(n);
+    if (n < 1e6) return (n / 1e3).toFixed(n < 1e4 ? 1 : 0) + "k";
+    if (n < 1e9) return (n / 1e6).toFixed(n < 1e7 ? 1 : 0) + "M";
+    return (n / 1e9).toFixed(1) + "G";
+  }
+  function add(a, b) { return [a[0] + b[0], a[1] + b[1]]; }
+  function dirname(p) { var i = p.lastIndexOf("/"); return i < 0 ? "." : p.slice(0, i); }
+  function basename(p) { var i = p.lastIndexOf("/"); return i < 0 ? p : p.slice(i + 1); }
+
+  var totals = files.reduce(function(t, f) {
+    return { lines: add(t.lines, f.lines), functions: add(t.functions, f.functions), branches: add(t.branches, f.branches) };
+  }, { lines: [0, 0], functions: [0, 0], branches: [0, 0] });
+
+  document.title = "Coverage · " + data.title;
+  document.getElementById("title").textContent = data.title;
+  document.getElementById("meta").textContent = data.projects.length + " test project" +
+    (data.projects.length === 1 ? "" : "s") + " · " + data.timestamp.replace("T", " ").replace("Z", " UTC");
+  document.getElementById("totals").innerHTML = ["lines", "functions", "branches"].map(function(k) {
+    return '<span class="pill">' + k + ' <b class="' + level(totals[k]) + '">' + fmtPct(totals[k]) + '</b>' + bar(totals[k]) + '</span>';
+  }).join("");
+
+  function buildTree(list) {
+    var root = { name: "", path: "", dirs: {}, files: [], lines: [0, 0] };
+    list.forEach(function(f) {
+      var parts = f.path.split("/");
+      var node = root;
+      node.lines = add(node.lines, f.lines);
+      for (var i = 0; i < parts.length - 1; i++) {
+        var p = parts.slice(0, i + 1).join("/");
+        if (!node.dirs[parts[i]]) node.dirs[parts[i]] = { name: parts[i], path: p, dirs: {}, files: [], lines: [0, 0] };
+        node = node.dirs[parts[i]];
+        node.lines = add(node.lines, f.lines);
+      }
+      node.files.push(f);
+    });
+    return root;
+  }
+
+  function compact(node) {
+    Object.keys(node.dirs).forEach(function(k) {
+      var child = node.dirs[k];
+      while (!child.files.length && Object.keys(child.dirs).length === 1) {
+        var only = child.dirs[Object.keys(child.dirs)[0]];
+        only.name = child.name + "/" + only.name;
+        child = only;
+      }
+      delete node.dirs[k];
+      node.dirs[child.name] = child;
+      compact(child);
+    });
+  }
+
+  function sortFiles(list) {
+    var mode = sortEl.value;
+    return list.slice().sort(function(a, b) {
+      if (mode === "low") return pct(a.lines) - pct(b.lines) || a.path.localeCompare(b.path);
+      if (mode === "missed") return (b.lines[1] - b.lines[0]) - (a.lines[1] - a.lines[0]) || a.path.localeCompare(b.path);
+      return a.path.localeCompare(b.path);
+    });
+  }
+
+  function renderTree() {
+    var q = filterEl.value.trim().toLowerCase();
+    var list = files.filter(function(f) {
+      if (q && f.path.toLowerCase().indexOf(q) < 0) return false;
+      if (uncoveredEl.checked && f.lines[0] === f.lines[1]) return false;
+      return true;
+    });
+    var html = [];
+    if (sortEl.value !== "name") {
+      sortFiles(list).forEach(function(f) { html.push(fileNode(f, 0, basename(f.path), dirname(f.path))); });
+    } else {
+      var root = buildTree(list);
+      compact(root);
+      walk(root, 0, html, q.length > 0);
+    }
+    treeEl.innerHTML = html.join("") || '<div class="empty">No files match.</div>';
+    markActive();
+  }
+
+  function fileNode(f, depth, label, dir) {
+    return '<div class="node file" data-file="' + f.index + '" style="padding-left:' + (10 + depth * 14) + 'px" title="' + esc(f.path) + '">' +
+      '<span class="twisty"></span><span class="name">' + esc(label) + (dir ? '<span class="dim">' + esc(dir) + '</span>' : '') +
+      '</span>' + bar(f.lines) +
+      '<span class="pct ' + level(f.lines) + '">' + fmtPct(f.lines) + '</span></div>';
+  }
+
+  function walk(node, depth, html, expandAll) {
+    Object.keys(node.dirs).sort().forEach(function(k) {
+      var d = node.dirs[k];
+      var closed = !expandAll && collapsed[d.path];
+      html.push('<div class="node dir" data-dir="' + esc(d.path) + '" style="padding-left:' + (10 + depth * 14) + 'px">' +
+        '<span class="twisty">' + (closed ? "▸" : "▾") + '</span><span class="name">' + esc(d.name) + '/</span>' +
+        bar(d.lines) + '<span class="pct ' + level(d.lines) + '">' + fmtPct(d.lines) + '</span></div>');
+      if (!closed) walk(d, depth + 1, html, expandAll);
+    });
+    node.files.slice().sort(function(a, b) { return a.path.localeCompare(b.path); }).forEach(function(f) {
+      html.push(fileNode(f, depth, basename(f.path)));
+    });
+  }
+
+  function markActive() {
+    var nodes = treeEl.querySelectorAll(".node.file");
+    for (var i = 0; i < nodes.length; i++) {
+      nodes[i].classList.toggle("active", +nodes[i].getAttribute("data-file") === current.file);
+    }
+  }
+
+  treeEl.addEventListener("click", function(e) {
+    var node = e.target.closest(".node");
+    if (!node) return;
+    if (node.hasAttribute("data-dir")) {
+      var p = node.getAttribute("data-dir");
+      collapsed[p] = !collapsed[p];
+      renderTree();
+    } else {
+      location.hash = "file=" + encodeURIComponent(files[+node.getAttribute("data-file")].path);
+      document.body.classList.remove("menu-open");
+    }
+  });
+  filterEl.addEventListener("input", renderTree);
+  uncoveredEl.addEventListener("change", renderTree);
+  sortEl.addEventListener("change", renderTree);
+  document.getElementById("menu").addEventListener("click", function() {
+    document.body.classList.toggle("menu-open");
+  });
+
+  function dirSummary() {
+    var dirs = {};
+    files.forEach(function(f) {
+      var d = dirname(f.path);
+      if (!dirs[d]) dirs[d] = { path: d, lines: [0, 0], functions: [0, 0], branches: [0, 0], files: 0 };
+      dirs[d].lines = add(dirs[d].lines, f.lines);
+      dirs[d].functions = add(dirs[d].functions, f.functions);
+      dirs[d].branches = add(dirs[d].branches, f.branches);
+      dirs[d].files++;
+    });
+    return Object.keys(dirs).sort().map(function(k) { return dirs[k]; });
+  }
+
+  function metricCell(c) {
+    return '<td><span class="cell"><span class="count">' + fmtNum(c[0]) + ' / ' + fmtNum(c[1]) + '</span>' +
+      '<span class="' + level(c) + '">' + fmtPct(c) + '</span>' + bar(c) + '</span></td>';
+  }
+
+  function sortRows(rows) {
+    var k = tableSort.key;
+    rows.sort(function(a, b) {
+      var r = k === "path" ? a.path.localeCompare(b.path) :
+        k === "missed" ? (a.lines[1] - a.lines[0]) - (b.lines[1] - b.lines[0]) : pct(a[k]) - pct(b[k]);
+      return (tableSort.asc ? r : -r) || a.path.localeCompare(b.path);
+    });
+    return rows;
+  }
+
+  function header(label, key) {
+    var cls = tableSort.key === key ? ' class="sorted' + (tableSort.asc ? " asc" : "") + '"' : "";
+    return '<th data-sort="' + key + '"' + cls + '>' + label + '</th>';
+  }
+
+  function renderOverview() {
+    current.file = -1;
+    markActive();
+    var html = ['<div class="page">'];
+    html.push('<div class="cards">');
+    ["lines", "functions", "branches"].forEach(function(k) {
+      html.push('<div class="card"><div class="label">' + k + '</div><div class="value ' + level(totals[k]) + '">' +
+        fmtPct(totals[k]) + '</div><div class="sub">' + fmtNum(totals[k][0]) + ' of ' + fmtNum(totals[k][1]) + ' covered</div>' +
+        bar(totals[k], true) + '</div>');
+    });
+    html.push('<div class="card"><div class="label">files</div><div class="value">' + fmtNum(files.length) +
+      '</div><div class="sub">' + fmtNum(files.filter(function(f) { return f.lines[0] === f.lines[1]; }).length) +
+      ' fully covered</div><div class="sub">tests: ' + esc(data.projects.join(", ")) + '</div></div>');
+    html.push('</div>');
+
+    html.push('<h2>Directories</h2><div class="tablewrap"><table class="grid"><thead><tr><th>directory</th><th>files</th><th>lines</th><th>functions</th><th>branches</th></tr></thead><tbody>');
+    dirSummary().forEach(function(d) {
+      html.push('<tr><td><a href="#" data-filter="' + esc(d.path + "/") + '">' + esc(d.path) + '</a></td><td>' + d.files + '</td>' +
+        metricCell(d.lines) + metricCell(d.functions) + metricCell(d.branches) + '</tr>');
+    });
+    html.push('</tbody></table></div>');
+
+    html.push('<h2>Files</h2><div class="tablewrap"><table class="grid" id="filetable"><thead><tr>' + header("file", "path") + header("uncovered lines", "missed") +
+      header("lines", "lines") + header("functions", "functions") + header("branches", "branches") + '</tr></thead><tbody>');
+    sortRows(files.slice()).forEach(function(f) {
+      html.push('<tr><td><a href="#file=' + encodeURIComponent(f.path) + '">' + esc(f.path) + '</a></td><td>' +
+        fmtNum(f.lines[1] - f.lines[0]) + '</td>' + metricCell(f.lines) + metricCell(f.functions) + metricCell(f.branches) + '</tr>');
+    });
+    html.push('</tbody></table></div>');
+    html.push('<p class="hint">Keyboard: <kbd>n</kbd> / <kbd>p</kbd> jump to the next / previous uncovered block in a file, <kbd>/</kbd> filters files.</p>');
+    html.push('</div>');
+    main.innerHTML = html.join("");
+    main.scrollTop = 0;
+  }
+
+  main.addEventListener("click", function(e) {
+    var th = e.target.closest("th[data-sort]");
+    if (th) {
+      var key = th.getAttribute("data-sort");
+      tableSort = { key: key, asc: tableSort.key === key ? !tableSort.asc : key === "path" || key === "lines" || key === "functions" || key === "branches" };
+      var scroll = main.scrollTop;
+      renderOverview();
+      main.scrollTop = scroll;
+      return;
+    }
+    var f = e.target.closest("a[data-filter]");
+    if (f) {
+      e.preventDefault();
+      filterEl.value = f.getAttribute("data-filter");
+      renderTree();
+      document.body.classList.add("menu-open");
+      return;
+    }
+    var fn = e.target.closest("a[data-line]");
+    if (fn) {
+      e.preventDefault();
+      jumpTo(+fn.getAttribute("data-line"), true);
+      return;
+    }
+    var btn = e.target.closest("button[data-nav]");
+    if (btn) navigate(+btn.getAttribute("data-nav"));
+  });
+
+  function load(index) {
+    if (loaded[index]) return Promise.resolve(loaded[index]);
+    if (pending[index]) return pending[index].promise;
+    var entry = {};
+    entry.promise = new Promise(function(resolve, reject) {
+      entry.resolve = resolve;
+      var s = document.createElement("script");
+      s.src = "files/" + index + ".js";
+      s.charset = "utf-8";
+      s.onerror = function() { reject(new Error("failed to load " + s.src)); };
+      document.head.appendChild(s);
+    });
+    pending[index] = entry;
+    return entry.promise;
+  }
+
+  window.bakeCoverageFile = function(index, fileData) {
+    loaded[index] = fileData;
+    if (pending[index]) {
+      pending[index].resolve(fileData);
+      delete pending[index];
+    }
+  };
+
+  function renderFile(f, fd, line) {
+    current.file = f.index;
+    markActive();
+    var hits = {};
+    fd.lines.forEach(function(l) { hits[l[0]] = (hits[l[0]] || 0) + l[1]; });
+    var branches = {};
+    fd.branches.forEach(function(b) { branches[b[0]] = b; });
+    var src = fd.source === null ? null : fd.source.replace(/\n$/, "").split("\n");
+    var count = src ? src.length : fd.lines.reduce(function(m, l) { return Math.max(m, l[0]); }, 0);
+
+    var parts = f.path.split("/");
+    var crumbs = parts.map(function(p, i) {
+      if (i === parts.length - 1) return "<b>" + esc(p) + "</b>";
+      return '<a href="#" data-filter="' + esc(parts.slice(0, i + 1).join("/") + "/") + '">' + esc(p) + '</a>';
+    }).join("/");
+
+    var misses = [];
+    var html = ['<div class="filehead"><div class="crumbs">' + crumbs + '</div><div class="filestats">'];
+    ["lines", "functions", "branches"].forEach(function(k) {
+      html.push('<span class="pill">' + k + ' <b class="' + level(f[k]) + '">' + fmtPct(f[k]) + '</b> ' +
+        fmtNum(f[k][0]) + '/' + fmtNum(f[k][1]) + bar(f[k]) + '</span>');
+    });
+    html.push('<span class="legend"><span><span class="swatch" style="background:var(--gutter-hit)"></span>covered</span>' +
+      '<span><span class="swatch" style="background:var(--gutter-miss)"></span>not covered</span>' +
+      '<span><span class="swatch" style="background:var(--gutter-partial)"></span>branches missed</span></span>');
+    html.push('<span class="nav"><span id="navpos"></span><button class="btn" data-nav="-1" title="previous uncovered (p)">&uarr; prev</button>' +
+      '<button class="btn" data-nav="1" title="next uncovered (n)">next &darr;</button></span></div></div>');
+
+    var uncoveredFns = fd.functions.filter(function(fn) { return !fn[2]; }).sort(function(a, b) { return a[1] - b[1]; });
+    if (uncoveredFns.length) {
+      html.push('<details class="fns"' + (uncoveredFns.length <= 12 ? " open" : "") + '><summary>' + uncoveredFns.length +
+        ' function' + (uncoveredFns.length === 1 ? " was" : "s were") + ' never called</summary><div class="fnlist">');
+      uncoveredFns.forEach(function(fn) {
+        html.push('<a href="#" data-line="' + fn[1] + '" title="line ' + fn[1] + '">' + esc(fn[0]) + '</a>');
+      });
+      html.push('</div></details>');
+    }
+
+    if (!src) {
+      html.push('<div class="empty">Source file is not available at ' + esc(f.path) + '.</div>');
+    }
+    html.push('<div class="source">');
+    var prevMiss = false;
+    for (var i = 1; i <= count; i++) {
+      var h = hits[i];
+      var b = branches[i];
+      var cls = "";
+      if (h !== undefined) cls = h ? (b && b[1] < b[2] ? "partial" : "hit") : "miss";
+      var isMiss = cls === "miss" || cls === "partial";
+      if (isMiss && !prevMiss) misses.push(i);
+      if (h !== undefined) prevMiss = isMiss;
+      html.push('<div class="ln ' + cls + '" id="L' + i + '"><span class="no"><a href="#file=' + encodeURIComponent(f.path) +
+        '&line=' + i + '">' + i + '</a></span><span class="hits">' + (h === undefined ? "" : fmtHits(h)) + '</span>' +
+        '<span class="br"' + (b ? ' title="' + b[1] + ' of ' + b[2] + ' branches taken"' : "") + '>' +
+        (b && b[1] < b[2] ? b[1] + "/" + b[2] : "") + '</span><span class="code">' +
+        (src ? esc(src[i - 1] || "") : "") + '</span></div>');
+    }
+    html.push('</div>');
+    main.innerHTML = html.join("");
+    current.misses = misses;
+    current.missPos = -1;
+    updateNavPos();
+    if (line) {
+      jumpTo(line, false);
+    } else {
+      main.scrollTop = 0;
+    }
+  }
+
+  function updateNavPos() {
+    var el = document.getElementById("navpos");
+    if (!el) return;
+    el.textContent = current.misses.length ? (current.missPos < 0 ? current.misses.length + " uncovered blocks" :
+      "block " + (current.missPos + 1) + " of " + current.misses.length) : "fully covered";
+  }
+
+  function jumpTo(line, updateHash) {
+    var el = document.getElementById("L" + line);
+    if (!el) return;
+    var prev = main.querySelector(".ln.target");
+    if (prev) prev.classList.remove("target");
+    el.classList.add("target");
+    var head = main.querySelector(".filehead");
+    var offset = head ? head.offsetHeight : 0;
+    main.scrollTop = el.offsetTop - offset - main.clientHeight / 3;
+    if (updateHash && current.file >= 0) {
+      history.replaceState(null, "", "#file=" + encodeURIComponent(files[current.file].path) + "&line=" + line);
+    }
+  }
+
+  function navigate(dir) {
+    if (!current.misses.length) return;
+    var n = current.misses.length;
+    current.missPos = current.missPos < 0 ? (dir > 0 ? 0 : n - 1) : (current.missPos + dir + n) % n;
+    jumpTo(current.misses[current.missPos], true);
+    updateNavPos();
+  }
+
+  document.addEventListener("keydown", function(e) {
+    if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "SELECT")) {
+      if (e.key === "Escape") e.target.blur();
+      return;
+    }
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === "n" || e.key === "j") navigate(1);
+    else if (e.key === "p" || e.key === "k") navigate(-1);
+    else if (e.key === "/") { e.preventDefault(); filterEl.focus(); filterEl.select(); }
+  });
+
+  function route() {
+    var params = {};
+    location.hash.replace(/^#/, "").split("&").forEach(function(kv) {
+      var i = kv.indexOf("=");
+      if (i > 0) params[kv.slice(0, i)] = decodeURIComponent(kv.slice(i + 1));
+    });
+    var f = params.file !== undefined ? byPath[params.file] : null;
+    if (!f) {
+      renderOverview();
+      return;
+    }
+    var line = params.line ? +params.line : 0;
+    if (current.file === f.index && loaded[f.index]) {
+      if (line) jumpTo(line, false);
+      return;
+    }
+    main.innerHTML = '<div class="empty">Loading ' + esc(f.path) + '…</div>';
+    load(f.index).then(function(fd) { renderFile(f, fd, line); }, function(err) {
+      main.innerHTML = '<div class="empty">' + esc(err.message) + '</div>';
+    });
+  }
+
+  window.addEventListener("hashchange", route);
+  renderTree();
+  route();
+})();
+</script>
+</body>
+</html>

@@ -3,13 +3,16 @@
 #include "bake/environment.h"
 #include "bake/os.h"
 
-static int bake_should_skip_dir(const char *name, bool skip_special_dirs) {
+static int bake_should_skip_dir(const char *name, bool skip_special_dirs, bool include_tests) {
     if (bake_is_dot_dir(name) || name[0] == '.') return 1;
     static const char *always[] = {"tmp", "target", "out", "build", "template", "templates"};
     for (size_t i = 0; i < sizeof(always) / sizeof(always[0]); i++) {
         if (!strcmp(name, always[i])) return 1;
     }
     if (skip_special_dirs) {
+        if (include_tests && (!strcmp(name, "test") || !strcmp(name, "tests"))) {
+            return 0;
+        }
         static const char *special[] = {"test", "tests", "bench", "benchmarks", "example", "examples"};
         for (size_t i = 0; i < sizeof(special) / sizeof(special[0]); i++) {
             if (!strcmp(name, special[i])) return 1;
@@ -48,7 +51,9 @@ static int bake_discovery_visit(const bake_dir_entry_t *entry, void *ctx_ptr) {
     bake_discovery_ctx_t *ctx = ctx_ptr;
 
     if (entry->is_dir) {
-        if (bake_should_skip_dir(entry->name, ctx->skip_special_dirs)) {
+        if (bake_should_skip_dir(entry->name, ctx->skip_special_dirs,
+            ctx->ctx->discover_tests))
+        {
             return 1;
         }
         char *marker = bake_path_join(entry->path, ".bake-skip");

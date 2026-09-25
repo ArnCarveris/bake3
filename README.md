@@ -96,6 +96,7 @@ Commands:
   test [target]       Build and run test target
   bench [target]      Build and run benchmark target
   clean [target]      Remove build artifacts
+  coverage-report [target] Merge test coverage into a browsable report
   rebuild [target]    Clean and build
   list                List projects in bake environment
   ps                  List processes started by bake
@@ -120,6 +121,7 @@ Options:
   --local             Setup only: install into BAKE_HOME (skip /usr/local/bin)
   --standalone        Use amalgamated dependency sources in deps/
   --strict            Enable strict compiler warnings and checks
+  --coverage          Build with coverage instrumentation (clang only)
   --fix-lint          Run the lint command of projects with the autofix action
   --trace             Enable trace logging (Flecs log level 0)
   -j <count>          Number of parallel jobs for build/test execution
@@ -637,6 +639,112 @@ command could not be built). Parameterized runs add a `params` field.
 
 `fail` counts every failed case, including the timed out ones; `timeout` counts
 how many of those were killed by the timeout.
+
+### Coverage
+`--coverage` builds every project with clang source-based coverage
+instrumentation (`-fprofile-instr-generate -fcoverage-mapping`). It is accepted
+by `build`, `rebuild`, `run`, `test` and `bench`, and requires clang: bake
+fails with an error for other compilers (use `--cc clang --cxx clang++`) and on
+Windows and emscripten. The flags are part of the build fingerprint, so turning
+`--coverage` on or off rebuilds the affected projects.
+
+When a test project built with `--coverage` runs with `--json <path>`, the
+harness also writes a coverage report next to the test report. The `.json`
+extension of the path is replaced by `.coverage.json`:
+
+```sh
+bake3 run test/core --local-env --coverage -- -j 12 --json /tmp/core.json
+# writes /tmp/core.json and /tmp/core.coverage.json
+```
+
+```json
+{
+  "project": "core",
+  "timestamp": "2026-09-25T16:22:29Z",
+  "lines": {"count": 16, "covered": 8, "percent": 50.00},
+  "functions": {"count": 3, "covered": 1, "percent": 33.33},
+  "branches": {"count": 4, "covered": 3, "percent": 75.00},
+  "files": [
+    {"file": "/home/me/work/lib/src/lib.c",
+     "lines": {"count": 16, "covered": 8, "percent": 50.00},
+     "functions": {"count": 3, "covered": 1, "percent": 33.33},
+     "branches": {"count": 4, "covered": 3, "percent": 75.00},
+     "uncovered_lines": [[9, 9], [11, 17]],
+     "uncovered_functions": [{"name": "lib_unused", "line": 14}]}
+  ]
+}
+```
+
+- `lines`, `functions` and `branches` hold totals over all files, and the same
+  counts per file. `percent` is `100.00` when there is nothing to count.
+- `uncovered_lines` lists the lines that never ran as inclusive `[first, last]`
+  ranges. A range spans lines without code (blank lines, comments), so it
+  describes a block that did not run.
+- `uncovered_functions` lists the functions that were never called, with the
+  line they start on.
+- Sources of the test project itself and generated harness sources are left
+  out, so the report covers the code under test.
+
+Every case process writes its profile to `coverage/` in the build directory of
+the test project (`.bake/<arch-os-config>/coverage`, or
+`.bake/local_env/<name>/build/<project>/<arch-os-config>/coverage` with
+`--local-env`). A run of all cases or of a suite starts by removing the
+profiles of the previous run. After the run the harness merges the profiles
+into `coverage.profdata` with `llvm-profdata`, exports them to
+`coverage.lcov` with `llvm-cov` and converts that into the report. Both tools
+are looked up with `<cc> -print-prog-name`, so they match the compiler that
+instrumented the code. The merged files stay in the coverage directory for
+other tools, such as `llvm-cov show`. A case that is killed by its timeout
+does not write a profile.
+
+`bake run` and `bake bench` of a project built with `--coverage` also send
+profiles to that directory, so instrumented binaries do not leave
+`default.profraw` files in the project. `bake clean` removes the coverage
+directory together with the rest of the build output, and a `default.profraw`
+in the project directory.
+
+### Coverage reports
+`bake coverage-report [target]` merges the coverage of every test project in
+the target (the current directory by default) into one report. Unlike
+`build`, it looks inside `test` and `tests` directories, so running it in the
+root of a repository picks up all of its test projects. A target that is not a
+directory selects a single test project by id. The report uses the profiles
+the last test run of each project left behind, so run the tests with
+`--coverage` first, using the same `--local-env`, `--cfg` and `--cc` as the
+report:
+
+```sh
+bake3 run test/core --local-env --coverage -- -j 12
+bake3 run test/query --local-env --coverage -- -j 12
+bake3 coverage-report --local-env
+```
+
+The command prints a summary with the line, function and branch coverage of
+every directory and the total, and writes the report to
+`.bake/local_env/coverage_report` (`.bake/local_env/<name>/coverage_report`
+with `--local-env=<name>`, `.bake/coverage_report` in the current directory
+without `--local-env`):
+
+- `index.html`: a page for browsing the report. It opens from disk, without a
+  web server. The overview has the totals and sortable tables of directories
+  and files. The sidebar lists every file as a tree, which can be filtered,
+  limited to files with uncovered lines, and sorted by coverage. A file shows
+  its source with the execution count of every line: covered lines are green,
+  lines that never ran are red, and lines with a branch that was never taken
+  are yellow, with the number of taken branches next to them. `n` and `p` jump
+  between uncovered blocks, functions that were never called link to their
+  line, and every line has a link that can be shared.
+- `files/<n>.js`: source and line data of one file, loaded when the file is
+  opened.
+- `coverage.json`: the report in the format of the test harness report, with a
+  `projects` array that lists the test projects it combines.
+- `coverage.profdata` and `coverage.lcov`: the merged profile and its lcov
+  export, for use with other tools.
+
+When test projects share code, such as a library they all link, the counts of
+that code are added up, so a line is covered when any of the test projects ran
+it. Sources of the test projects themselves and files without code are left
+out. `bake clean` removes the report.
 
 ## Benchmarks
 A project with a `bench` section in its `project.json` is a benchmark project.

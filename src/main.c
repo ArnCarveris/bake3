@@ -57,6 +57,7 @@ int main(int argc, char *argv[]) {
         BFLAG("-r", recursive)
         BFLAG("--standalone", standalone)
         BFLAG("--strict", strict)
+        BFLAG("--coverage", coverage)
         BFLAG("--fix-lint", fix_lint)
         BFLAG("--trace", trace)
         BFLAG("--local", setup_local)
@@ -227,6 +228,12 @@ int main(int argc, char *argv[]) {
 
     if (opts.build_json && !bake_command_builds(opts.command)) {
         ecs_err("--build-json can only be used with the build, rebuild, run, "
+            "test and bench commands");
+        goto cleanup;
+    }
+
+    if (opts.coverage && !bake_command_builds(opts.command)) {
+        ecs_err("--coverage can only be used with the build, rebuild, run, "
             "test and bench commands");
         goto cleanup;
     }

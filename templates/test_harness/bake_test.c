@@ -1706,6 +1706,495 @@ static int bake_run_single_test(bake_test_suite *suites, uint32_t suite_count, c
     return -1;
 }
 
+#ifdef BAKE_TEST_COVERAGE_DIR
+#include <dirent.h>
+#include <limits.h>
+#include <sys/stat.h>
+
+void __llvm_profile_set_filename(const char *name);
+
+#define BAKE_TEST_COVERAGE_PATTERN BAKE_TEST_COVERAGE_DIR "/profile-%8m.profraw"
+
+static const char *g_coverage_exclude[] = BAKE_TEST_COVERAGE_EXCLUDE;
+
+typedef struct bake_coverage_count_t {
+    long count;
+    long covered;
+} bake_coverage_count_t;
+
+typedef struct bake_coverage_totals_t {
+    bake_coverage_count_t lines;
+    bake_coverage_count_t functions;
+    bake_coverage_count_t branches;
+} bake_coverage_totals_t;
+
+typedef struct bake_coverage_fn_t {
+    char *name;
+    long line;
+    bool uncovered;
+} bake_coverage_fn_t;
+
+typedef struct bake_coverage_file_t {
+    char *path;
+    bake_coverage_totals_t totals;
+    bake_coverage_fn_t *fns;
+    int fn_count;
+    int fn_cap;
+    long *ranges;
+    int range_count;
+    int range_cap;
+    bool in_range;
+} bake_coverage_file_t;
+
+static bool bake_coverage_is_profile(const char *name) {
+    size_t len = strlen(name);
+    return len > 8 && !strcmp(name + len - 8, ".profraw");
+}
+
+static void bake_coverage_init(bool reset) {
+    mkdir(BAKE_TEST_COVERAGE_DIR, 0755);
+
+    DIR *dir = reset ? opendir(BAKE_TEST_COVERAGE_DIR) : NULL;
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir))) {
+            if (bake_coverage_is_profile(entry->d_name)) {
+                char path[PATH_MAX];
+                snprintf(path, sizeof(path), "%s/%s",
+                    BAKE_TEST_COVERAGE_DIR, entry->d_name);
+                unlink(path);
+            }
+        }
+        closedir(dir);
+    }
+
+    setenv("LLVM_PROFILE_FILE", BAKE_TEST_COVERAGE_PATTERN, 1);
+    __llvm_profile_set_filename(BAKE_TEST_COVERAGE_PATTERN);
+}
+
+static char* bake_coverage_merge_cmd(const char *profdata) {
+    DIR *dir = opendir(BAKE_TEST_COVERAGE_DIR);
+    if (!dir) {
+        return NULL;
+    }
+
+    size_t cap = strlen(BAKE_TEST_COVERAGE_PROFDATA) + strlen(profdata) + 128;
+    char *cmd = malloc(cap);
+    if (!cmd) {
+        closedir(dir);
+        return NULL;
+    }
+
+    size_t len = (size_t)snprintf(cmd, cap,
+        "\"%s\" merge -sparse -failure-mode=all -o \"%s\"",
+        BAKE_TEST_COVERAGE_PROFDATA, profdata);
+
+    int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        if (!bake_coverage_is_profile(entry->d_name)) {
+            continue;
+        }
+        size_t need = len + strlen(BAKE_TEST_COVERAGE_DIR) +
+            strlen(entry->d_name) + 8;
+        if (need >= cap) {
+            cap = need * 2;
+            char *tmp = realloc(cmd, cap);
+            if (!tmp) {
+                free(cmd);
+                closedir(dir);
+                return NULL;
+            }
+            cmd = tmp;
+        }
+        len += (size_t)snprintf(cmd + len, cap - len, " \"%s/%s\"",
+            BAKE_TEST_COVERAGE_DIR, entry->d_name);
+        count ++;
+    }
+    closedir(dir);
+
+    if (!count) {
+        free(cmd);
+        return NULL;
+    }
+    return cmd;
+}
+
+static bool bake_coverage_excluded(const char *path) {
+    for (int i = 0; g_coverage_exclude[i]; i++) {
+        const char *prefix = g_coverage_exclude[i];
+        size_t len = strlen(prefix);
+        if (len && !strncmp(path, prefix, len) &&
+            (path[len] == '/' || path[len] == '\0' || prefix[len - 1] == '/'))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char* bake_coverage_fn_name(const char *name) {
+    const char *colon = strrchr(name, ':');
+    const char *semi = strrchr(name, ';');
+    const char *sep = colon;
+    if (semi && (!sep || semi > sep)) {
+        sep = semi;
+    }
+    return sep ? sep + 1 : name;
+}
+
+static double bake_coverage_percent(const bake_coverage_count_t *c) {
+    return c->count ? ((double)c->covered * 100.0) / (double)c->count : 100.0;
+}
+
+static void bake_coverage_write_count(
+    FILE *f,
+    const char *name,
+    const bake_coverage_count_t *c)
+{
+    fprintf(f, "\"%s\": {\"count\": %ld, \"covered\": %ld, \"percent\": %.2f}",
+        name, c->count, c->covered, bake_coverage_percent(c));
+}
+
+static void bake_coverage_write_totals(
+    FILE *f,
+    const char *indent,
+    const bake_coverage_totals_t *t)
+{
+    fputs(indent, f);
+    bake_coverage_write_count(f, "lines", &t->lines);
+    fprintf(f, ",\n%s", indent);
+    bake_coverage_write_count(f, "functions", &t->functions);
+    fprintf(f, ",\n%s", indent);
+    bake_coverage_write_count(f, "branches", &t->branches);
+}
+
+static void bake_coverage_add(
+    bake_coverage_totals_t *dst,
+    const bake_coverage_totals_t *src)
+{
+    dst->lines.count += src->lines.count;
+    dst->lines.covered += src->lines.covered;
+    dst->functions.count += src->functions.count;
+    dst->functions.covered += src->functions.covered;
+    dst->branches.count += src->branches.count;
+    dst->branches.covered += src->branches.covered;
+}
+
+static void bake_coverage_file_reset(bake_coverage_file_t *file) {
+    free(file->path);
+    for (int i = 0; i < file->fn_count; i++) {
+        free(file->fns[i].name);
+    }
+    free(file->fns);
+    free(file->ranges);
+    memset(file, 0, sizeof(*file));
+}
+
+static void bake_coverage_add_fn(
+    bake_coverage_file_t *file,
+    const char *name,
+    long line)
+{
+    if (file->fn_count == file->fn_cap) {
+        int cap = file->fn_cap ? file->fn_cap * 2 : 32;
+        bake_coverage_fn_t *tmp = realloc(
+            file->fns, (size_t)cap * sizeof(bake_coverage_fn_t));
+        if (!tmp) {
+            return;
+        }
+        file->fns = tmp;
+        file->fn_cap = cap;
+    }
+    bake_coverage_fn_t *fn = &file->fns[file->fn_count ++];
+    fn->name = bake_strdup(bake_coverage_fn_name(name));
+    fn->line = line;
+    fn->uncovered = false;
+}
+
+static void bake_coverage_mark_fn(
+    bake_coverage_file_t *file,
+    const char *name,
+    unsigned long long hits)
+{
+    if (hits) {
+        return;
+    }
+    name = bake_coverage_fn_name(name);
+    for (int i = 0; i < file->fn_count; i++) {
+        if (file->fns[i].name && !strcmp(file->fns[i].name, name)) {
+            file->fns[i].uncovered = true;
+            return;
+        }
+    }
+}
+
+static void bake_coverage_add_line(
+    bake_coverage_file_t *file,
+    long line,
+    unsigned long long hits)
+{
+    if (hits) {
+        file->in_range = false;
+        return;
+    }
+
+    if (file->in_range) {
+        file->ranges[file->range_count * 2 - 1] = line;
+        return;
+    }
+
+    if (file->range_count == file->range_cap) {
+        int cap = file->range_cap ? file->range_cap * 2 : 32;
+        long *tmp = realloc(file->ranges, (size_t)cap * 2 * sizeof(long));
+        if (!tmp) {
+            return;
+        }
+        file->ranges = tmp;
+        file->range_cap = cap;
+    }
+    file->ranges[file->range_count * 2] = line;
+    file->ranges[file->range_count * 2 + 1] = line;
+    file->range_count ++;
+    file->in_range = true;
+}
+
+static void bake_coverage_write_file(
+    FILE *f,
+    const bake_coverage_file_t *file,
+    bool first)
+{
+    fputs(first ? "\n    {\"file\": " : ",\n    {\"file\": ", f);
+    bake_json_string(f, file->path);
+    fputs(",\n", f);
+    bake_coverage_write_totals(f, "     ", &file->totals);
+    fputs(",\n     \"uncovered_lines\": [", f);
+    for (int i = 0; i < file->range_count; i++) {
+        fprintf(f, "%s[%ld, %ld]", i ? ", " : "",
+            file->ranges[i * 2], file->ranges[i * 2 + 1]);
+    }
+    fputs("],\n     \"uncovered_functions\": [", f);
+    bool first_fn = true;
+    for (int i = 0; i < file->fn_count; i++) {
+        const bake_coverage_fn_t *fn = &file->fns[i];
+        if (!fn->uncovered || !fn->name) {
+            continue;
+        }
+        fputs(first_fn ? "{\"name\": " : ", {\"name\": ", f);
+        bake_json_string(f, fn->name);
+        fprintf(f, ", \"line\": %ld}", fn->line);
+        first_fn = false;
+    }
+    fputs("]}", f);
+}
+
+static int bake_coverage_parse_lcov(
+    FILE *lcov,
+    FILE *files_out,
+    bake_coverage_totals_t *totals,
+    int *file_count)
+{
+    bake_coverage_file_t file = {0};
+    char *line = NULL;
+    size_t line_cap = 0;
+    ssize_t line_len;
+
+    while ((line_len = getline(&line, &line_cap, lcov)) >= 0) {
+        while (line_len && (line[line_len - 1] == '\n' || line[line_len - 1] == '\r')) {
+            line[-- line_len] = '\0';
+        }
+
+        if (!strncmp(line, "SF:", 3)) {
+            bake_coverage_file_reset(&file);
+            file.path = bake_strdup(line + 3);
+        } else if (!strncmp(line, "FN:", 3)) {
+            char *end = NULL;
+            long fn_line = strtol(line + 3, &end, 10);
+            if (end && *end == ',') {
+                bake_coverage_add_fn(&file, end + 1, fn_line);
+            }
+        } else if (!strncmp(line, "FNDA:", 5)) {
+            char *end = NULL;
+            unsigned long long hits = strtoull(line + 5, &end, 10);
+            if (end && *end == ',') {
+                bake_coverage_mark_fn(&file, end + 1, hits);
+            }
+        } else if (!strncmp(line, "DA:", 3)) {
+            char *end = NULL;
+            long da_line = strtol(line + 3, &end, 10);
+            if (end && *end == ',') {
+                bake_coverage_add_line(&file, da_line, strtoull(end + 1, NULL, 10));
+            }
+        } else if (!strncmp(line, "LF:", 3)) {
+            file.totals.lines.count = strtol(line + 3, NULL, 10);
+        } else if (!strncmp(line, "LH:", 3)) {
+            file.totals.lines.covered = strtol(line + 3, NULL, 10);
+        } else if (!strncmp(line, "FNF:", 4)) {
+            file.totals.functions.count = strtol(line + 4, NULL, 10);
+        } else if (!strncmp(line, "FNH:", 4)) {
+            file.totals.functions.covered = strtol(line + 4, NULL, 10);
+        } else if (!strncmp(line, "BRF:", 4)) {
+            file.totals.branches.count = strtol(line + 4, NULL, 10);
+        } else if (!strncmp(line, "BRH:", 4)) {
+            file.totals.branches.covered = strtol(line + 4, NULL, 10);
+        } else if (!strcmp(line, "end_of_record")) {
+            if (file.path && !bake_coverage_excluded(file.path)) {
+                bake_coverage_write_file(files_out, &file, *file_count == 0);
+                bake_coverage_add(totals, &file.totals);
+                (*file_count) ++;
+            }
+            bake_coverage_file_reset(&file);
+        }
+    }
+
+    free(line);
+    bake_coverage_file_reset(&file);
+    return 0;
+}
+
+static char* bake_coverage_json_path(void) {
+    size_t len = strlen(g_json_path);
+    size_t base_len = len;
+    if (len >= 5 && !strcmp(g_json_path + len - 5, ".json")) {
+        base_len = len - 5;
+    }
+    size_t size = base_len + sizeof(".coverage.json");
+    char *path = malloc(size);
+    if (path) {
+        snprintf(path, size, "%.*s.coverage.json", (int)base_len, g_json_path);
+    }
+    return path;
+}
+
+static int bake_coverage_write_report(
+    const char *test_id,
+    const char *lcov_path,
+    const char *json_path)
+{
+    FILE *lcov = fopen(lcov_path, "r");
+    if (!lcov) {
+        printf("failed to open coverage data '%s': %s\n", lcov_path, strerror(errno));
+        return -1;
+    }
+
+    FILE *files = tmpfile();
+    if (!files) {
+        fclose(lcov);
+        printf("failed to create temporary file for coverage report\n");
+        return -1;
+    }
+
+    bake_coverage_totals_t totals = {0};
+    int file_count = 0;
+    bake_coverage_parse_lcov(lcov, files, &totals, &file_count);
+    fclose(lcov);
+
+    FILE *f = fopen(json_path, "w");
+    if (!f) {
+        fclose(files);
+        printf("failed to open coverage report '%s': %s\n", json_path, strerror(errno));
+        return -1;
+    }
+
+    time_t now = time(NULL);
+    char stamp[64] = {0};
+    strftime(stamp, sizeof(stamp), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
+
+    fputs("{\n", f);
+    fputs("  \"project\": ", f); bake_json_string(f, test_id); fputs(",\n", f);
+    fputs("  \"timestamp\": ", f); bake_json_string(f, stamp); fputs(",\n", f);
+    bake_coverage_write_totals(f, "  ", &totals);
+    fputs(",\n  \"files\": [", f);
+
+    rewind(files);
+    char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), files)) > 0) {
+        fwrite(buf, 1, n, f);
+    }
+    fclose(files);
+
+    fputs(file_count ? "\n  ]\n}\n" : "]\n}\n", f);
+    fclose(f);
+
+    printf("coverage: %.2f%% lines (%ld/%ld), %.2f%% functions (%ld/%ld), "
+        "%.2f%% branches (%ld/%ld)\n",
+        bake_coverage_percent(&totals.lines),
+        totals.lines.covered, totals.lines.count,
+        bake_coverage_percent(&totals.functions),
+        totals.functions.covered, totals.functions.count,
+        bake_coverage_percent(&totals.branches),
+        totals.branches.covered, totals.branches.count);
+    return 0;
+}
+
+static int bake_coverage_report(const char *test_id, const char *exec) {
+    if (!g_json_path) {
+        return 0;
+    }
+
+    int rc = -1;
+    char profdata[PATH_MAX];
+    char lcov_path[PATH_MAX];
+    char exe[PATH_MAX];
+    char *merge_cmd = NULL;
+    char *export_cmd = NULL;
+    char *json_path = NULL;
+
+    snprintf(profdata, sizeof(profdata), "%s/coverage.profdata", BAKE_TEST_COVERAGE_DIR);
+    snprintf(lcov_path, sizeof(lcov_path), "%s/coverage.lcov", BAKE_TEST_COVERAGE_DIR);
+    if (!strchr(exec, '/') || !realpath(exec, exe)) {
+        snprintf(exe, sizeof(exe), "%s", exec);
+    }
+
+    merge_cmd = bake_coverage_merge_cmd(profdata);
+    if (!merge_cmd) {
+        printf("no coverage data found in %s\n", BAKE_TEST_COVERAGE_DIR);
+        goto cleanup;
+    }
+
+    if (bake_run_subprocess(merge_cmd, 0, NULL) != 0) {
+        printf("failed to merge coverage data: %s\n", merge_cmd);
+        goto cleanup;
+    }
+
+    size_t export_size = strlen(BAKE_TEST_COVERAGE_COV) + strlen(profdata) +
+        strlen(exe) + 64;
+    export_cmd = malloc(export_size);
+    if (!export_cmd) {
+        goto cleanup;
+    }
+    snprintf(export_cmd, export_size,
+        "\"%s\" export -format=lcov -instr-profile=\"%s\" \"%s\"",
+        BAKE_TEST_COVERAGE_COV, profdata, exe);
+
+    FILE *lcov = fopen(lcov_path, "w");
+    if (!lcov) {
+        printf("failed to open '%s': %s\n", lcov_path, strerror(errno));
+        goto cleanup;
+    }
+    int export_rc = bake_run_subprocess_to_stream(export_cmd, lcov, 0, NULL);
+    fclose(lcov);
+    if (export_rc != 0) {
+        printf("failed to export coverage data: %s\n", export_cmd);
+        goto cleanup;
+    }
+
+    json_path = bake_coverage_json_path();
+    if (!json_path) {
+        goto cleanup;
+    }
+
+    rc = bake_coverage_write_report(test_id, lcov_path, json_path);
+
+cleanup:
+    free(merge_cmd);
+    free(export_cmd);
+    free(json_path);
+    return rc;
+}
+#endif
+
 int bake_test_run(const char *test_id, int argc, char *argv[], bake_test_suite *suites, uint32_t suite_count) {
     if (!test_id || !test_id[0]) {
         test_id = "test";
@@ -1791,6 +2280,10 @@ int bake_test_run(const char *test_id, int argc, char *argv[], bake_test_suite *
         }
     }
 
+#ifdef BAKE_TEST_COVERAGE_DIR
+    bake_coverage_init(!single_test);
+#endif
+
     if (single_test) {
         return bake_run_single_test(suites, suite_count, single_test);
     }
@@ -1842,6 +2335,12 @@ int bake_test_run(const char *test_id, int argc, char *argv[], bake_test_suite *
     if (bake_write_json_report(test_id, pass, fail, empty, bake_time_now() - start) != 0) {
         rc = -1;
     }
+
+#ifdef BAKE_TEST_COVERAGE_DIR
+    if (bake_coverage_report(test_id, argv[0]) != 0) {
+        rc = -1;
+    }
+#endif
 
     return rc;
 }

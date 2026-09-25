@@ -24,6 +24,7 @@ typedef struct bake_options_t {
     bool recursive;
     bool standalone;
     bool strict;
+    bool coverage;
     bool fix_lint;
     bool trace;
     bool setup_local;
@@ -40,7 +41,10 @@ typedef struct bake_context_t {
     char *bake_home;
     bake_build_report_t *report;
     bake_compiler_kind_t compiler_kind;
+    char *coverage_profdata;
+    char *coverage_cov;
     bool prepare_bundles;
+    bool discover_tests;
     int32_t thread_count;
 } bake_context_t;
 

@@ -27,6 +27,8 @@ typedef struct bake_suite_list_t {
 
 void bake_suite_list_fini(bake_suite_list_t *list);
 
+void bake_append_c_literal(ecs_strbuf_t *out, const char *value);
+
 int bake_parse_project_tests(const char *path, bake_suite_list_t *out);
 
 int bake_generate_suite_file(

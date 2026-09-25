@@ -614,6 +614,7 @@ static int bake_build_one(bake_context_t *ctx, ecs_entity_t project_entity, cons
     bake_strlist_init(&mode_ldflags);
     bake_add_mode_flags(request->mode, ctx->compiler_kind, &mode_cflags, &mode_cxxflags, &mode_ldflags);
     bake_add_strict_flags(ctx->opts.strict, ctx->compiler_kind, &mode_cflags, &mode_cxxflags, &mode_ldflags);
+    bake_add_coverage_flags(ctx->opts.coverage, &mode_cflags, &mode_cxxflags, &mode_ldflags);
 
     if (bake_project_kind_is_harness(cfg->kind) &&
         ctx->compiler_kind != BAKE_COMPILER_MSVC &&
@@ -899,6 +900,9 @@ static int bake_prepare_discovery(bake_context_t *ctx, char **target_path_out) {
     }
 
     ctx->compiler_kind = bake_detect_compiler_kind(ctx->opts.cc, ctx->opts.cxx);
+    if (bake_coverage_prepare(ctx) != 0) {
+        goto cleanup;
+    }
     rc = 0;
 
 cleanup:
@@ -961,6 +965,12 @@ static int bake_clean_project(const bake_context_t *ctx, const bake_project_cfg_
 
     ecs_os_free(bake_dir);
 
+    char *profraw = bake_path_join(cfg->path, "default.profraw");
+    if (rc == 0) {
+        rc = bake_remove_file_if_exists(profraw);
+    }
+    ecs_os_free(profraw);
+
     /* Generated standalone sources in deps/ are preserved, like bundle
      * artefacts: they are refreshed from dependency fingerprints on build and
      * may not be regenerable when the dependency source is not available. */
@@ -994,6 +1004,13 @@ static int bake_build_clean_prepared(bake_context_t *ctx, const char *target) {
         }
     }
 
+    char *report_dir = bake_coverage_report_dir();
+    if (report_dir && bake_path_is_dir(report_dir) && bake_os_rmtree(report_dir) != 0) {
+        ecs_os_free(report_dir);
+        goto cleanup;
+    }
+    ecs_os_free(report_dir);
+
     rc = 0;
 cleanup:
     ecs_os_free(order);
@@ -1010,6 +1027,18 @@ int bake_build_clean(bake_context_t *ctx) {
         ? target_path
         : bake_effective_build_target(ctx);
     int rc = bake_build_clean_prepared(ctx, target);
+    ecs_os_free(target_path);
+    return rc;
+}
+
+int bake_build_coverage_report(bake_context_t *ctx) {
+    char *target_path = NULL;
+    ctx->discover_tests = true;
+    if (bake_prepare_discovery(ctx, &target_path) != 0) {
+        return -1;
+    }
+
+    int rc = bake_coverage_report_generate(ctx, target_path);
     ecs_os_free(target_path);
     return rc;
 }
@@ -1191,6 +1220,11 @@ int bake_build_run(bake_context_t *ctx) {
     if (!strcmp(ctx->opts.command, "run")) {
         if (bake_target_is_emscripten()) {
             rc = bake_run_em_artefact(result->artefact, ctx->opts.port);
+            goto cleanup;
+        }
+
+        if (bake_coverage_export_env(ctx, project->cfg) != 0) {
+            rc = -1;
             goto cleanup;
         }
 

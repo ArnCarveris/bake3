@@ -2,7 +2,7 @@
 #include "bake/os.h"
 #include "common/harness_util.h"
 
-static void bake_append_c_literal(ecs_strbuf_t *out, const char *value) {
+void bake_append_c_literal(ecs_strbuf_t *out, const char *value) {
     ecs_strbuf_appendch(out, '"');
     for (const char *p = value; *p; p++) {
         if (*p == '"' || *p == '\\') {
