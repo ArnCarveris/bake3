@@ -733,14 +733,6 @@ static void bake_bench_write_counters(FILE *f, const bake_bench_result_t *r) {
         fprintf(f, ", \"total\": %.6f, \"per_iter\": %.6f}",
             r->counter_values[i], per_iter);
     }
-    fputs("],\n", f);
-}
-
-static void bake_bench_write_samples(FILE *f, const bake_bench_result_t *r) {
-    fputs("      \"sample_ns\": [", f);
-    for (int32_t i = 0; i < r->samples; i ++) {
-        fprintf(f, "%s%.6f", i ? ", " : "", r->sample_ns[i]);
-    }
     fputs("]\n", f);
 }
 
@@ -778,7 +770,6 @@ static void bake_bench_write_result(FILE *f, const bake_bench_result_t *r, bool 
     }
     fprintf(f, "      \"time_sec\": %.6f,\n", r->time_sec);
     bake_bench_write_counters(f, r);
-    bake_bench_write_samples(f, r);
     fprintf(f, "    }%s\n", last ? "" : ",");
 }
 

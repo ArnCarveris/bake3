@@ -2511,7 +2511,7 @@ class BakeTests(unittest.TestCase):
         self.assertEqual(set(by_case), {"add", "mul"})
         for case in by_case.values():
             self.assertEqual(case["status"], "ok")
-            self.assertEqual(len(case["sample_ns"]), case["samples"])
+            self.assertNotIn("sample_ns", case)
         self.assertEqual(by_case["add"]["items_per_iter"], 2)
         counters = {c["name"]: c for c in by_case["add"]["counters"]}
         self.assertAlmostEqual(counters["adds"]["per_iter"], 1.0, places=3)
@@ -2595,7 +2595,7 @@ class BakeTests(unittest.TestCase):
             self.assertGreaterEqual(case["iterations"], 1)
             self.assertGreaterEqual(case["samples"], 1)
             self.assertLessEqual(case["samples"], 5)
-            self.assertEqual(len(case["sample_ns"]), case["samples"])
+            self.assertNotIn("sample_ns", case)
             self.assertEqual(
                 case["total_iterations"], case["iterations"] * case["samples"])
             self.assertLessEqual(case["min_ns"], case["median_ns"])
@@ -2610,7 +2610,7 @@ class BakeTests(unittest.TestCase):
             self.assertGreaterEqual(case["outliers"], 0)
             self.assertGreaterEqual(case["outliers_severe"], 0)
             self.assertGreater(case["time_sec"], 0.0)
-            self.assertGreater(min(case["sample_ns"]), 0.0)
+            self.assertGreater(case["min_ns"], 0.0)
 
         self.assertEqual(by_case["add"]["items_per_iter"], 2)
         self.assertGreater(by_case["add"]["items_per_sec"], 0.0)

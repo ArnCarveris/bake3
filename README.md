@@ -809,8 +809,8 @@ REGRESSION Entity.new +22.9%
 ```
 
 ### Report format
-`--json` writes every statistic in nanoseconds, plus the raw samples, in the
-same field style as the test report:
+`--json` writes the summary statistics of every case in nanoseconds, in the
+same field style as the test report. Individual samples are not stored:
 
 ```json
 {
@@ -842,8 +842,7 @@ same field style as the test report:
       "outliers": 4, "outliers_severe": 1,
       "items_per_iter": 1, "items_per_sec": 39366898.0,
       "time_sec": 1.204,
-      "counters": [{"name": "entities", "total": 39700000.0, "per_iter": 1.0}],
-      "sample_ns": [25.31, 25.28, 25.44]
+      "counters": [{"name": "entities", "total": 39700000.0, "per_iter": 1.0}]
     }
   ],
   "failures": [
