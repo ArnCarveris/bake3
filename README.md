@@ -124,6 +124,9 @@ Options:
   --standalone        Use amalgamated dependency sources in deps/
   --strict            Enable strict compiler warnings and checks
   --coverage          Build with coverage instrumentation (clang only)
+  --coverage-root <dir> Make coverage report paths relative to dir (default: cwd)
+  --coverage-include <patterns> Only report files matching a comma separated prefix or glob
+  --coverage-exclude <patterns> Leave out files matching a comma separated prefix or glob
   --fix-lint          Run the lint command of projects with the autofix action
   --trace             Enable trace logging (Flecs log level 0)
   -j <count>          Number of parallel jobs for build/test execution
@@ -650,9 +653,10 @@ fails with an error for other compilers (use `--cc clang --cxx clang++`) and on
 Windows and emscripten. The flags are part of the build fingerprint, so turning
 `--coverage` on or off rebuilds the affected projects.
 
-When a test project built with `--coverage` runs with `--json <path>`, the
-harness also writes a coverage report next to the test report. The `.json`
-extension of the path is replaced by `.coverage.json`:
+When `bake run` or `bake test` runs a test project built with `--coverage`
+with `--json <path>`, bake also writes a coverage report next to the test
+report once the harness has written it. The `.json` extension of the path is
+replaced by `.coverage.json`:
 
 ```sh
 bake3 run test/core --local-env --coverage -- -j 12 --json /tmp/core.json
@@ -667,7 +671,7 @@ bake3 run test/core --local-env --coverage -- -j 12 --json /tmp/core.json
   "functions": {"count": 3, "covered": 1, "percent": 33.33},
   "branches": {"count": 4, "covered": 3, "percent": 75.00},
   "files": [
-    {"file": "/home/me/work/lib/src/lib.c",
+    {"file": "lib/src/lib.c",
      "lines": {"count": 16, "covered": 8, "percent": 50.00},
      "functions": {"count": 3, "covered": 1, "percent": 33.33},
      "branches": {"count": 4, "covered": 3, "percent": 75.00},
@@ -686,12 +690,42 @@ bake3 run test/core --local-env --coverage -- -j 12 --json /tmp/core.json
   line they start on.
 - Sources of the test project itself and generated harness sources are left
   out, so the report covers the code under test.
+- `files` is sorted by path.
+
+#### Paths and filters
+`file` is the path of the source relative to the coverage root, which is the
+directory bake runs in unless `--coverage-root <dir>` sets another one (a
+relative `<dir>` is resolved against the current directory). Sources outside
+the root keep their absolute path.
+
+`--coverage-include <patterns>` keeps only the files that match one of a comma
+separated list of patterns, and `--coverage-exclude <patterns>` leaves out the
+files that match one. A file is matched on its path relative to the root (its
+absolute path when it is outside the root):
+
+- A pattern without `*` or `?` is a path prefix that matches whole path
+  components: `src` matches `src/lib.c` and `src/sub/lib.c`, not `srcx/lib.c`.
+- A pattern with `*` or `?` is a glob that has to match the whole path. `*`
+  matches any characters except `/`, `**` also matches `/` (so `src/**/*.c`
+  matches `src/lib.c` and `src/sub/lib.c`) and `?` matches one character
+  except `/`.
+
+The totals are the sums over the files that are kept:
+
+```sh
+bake3 run test/core --local-env --coverage --coverage-include src,include \
+  --coverage-exclude 'src/addons/**' -- -j 12 --json /tmp/core.json
+```
+
+The options are accepted by `run` and `test` together with `--coverage`, and by
+`coverage-report`, which applies them the same way to `coverage.json`, the
+summary and the html report.
 
 Every case process writes its profile to `coverage/` in the build directory of
 the test project (`.bake/<arch-os-config>/coverage`, or
 `.bake/local_env/<name>/build/<project>/<arch-os-config>/coverage` with
 `--local-env`). A run of all cases or of a suite starts by removing the
-profiles of the previous run. After the run the harness merges the profiles
+profiles of the previous run. After the run bake merges the profiles
 into `coverage.profdata` with `llvm-profdata`, exports them to
 `coverage.lcov` with `llvm-cov` and converts that into the report. Both tools
 are looked up with `<cc> -print-prog-name`, so they match the compiler that

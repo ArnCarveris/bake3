@@ -58,6 +58,12 @@ typedef struct bake_cov_report_t {
     bake_cov_totals_t totals;
     char *out_dir;
     char *title;
+    char *root;
+    char *root_resolved;
+    bake_strlist_t include;
+    bake_strlist_t exclude;
+    bool keep_empty;
+    bool merged;
 } bake_cov_report_t;
 
 char* bake_coverage_report_dir(void) {
@@ -115,6 +121,171 @@ static void bake_cov_report_fini(bake_cov_report_t *report) {
 
     ecs_os_free(report->out_dir);
     ecs_os_free(report->title);
+    ecs_os_free(report->root);
+    ecs_os_free(report->root_resolved);
+    bake_strlist_fini(&report->include);
+    bake_strlist_fini(&report->exclude);
+}
+
+static bool bake_cov_has_glob(const char *pattern) {
+    return strpbrk(pattern, "*?") != NULL;
+}
+
+static bool bake_cov_glob(const char *pattern, const char *path) {
+    for (;;) {
+        if (!pattern[0]) {
+            return !path[0];
+        }
+
+        if (pattern[0] == '*' && pattern[1] == '*') {
+            const char *rest = pattern + 2;
+            if (rest[0] == '/' && bake_cov_glob(rest + 1, path)) {
+                return true;
+            }
+            for (const char *cur = path;; cur++) {
+                if (bake_cov_glob(rest, cur)) {
+                    return true;
+                }
+                if (!cur[0]) {
+                    return false;
+                }
+            }
+        }
+
+        if (pattern[0] == '*') {
+            for (const char *cur = path;; cur++) {
+                if (bake_cov_glob(pattern + 1, cur)) {
+                    return true;
+                }
+                if (!cur[0] || cur[0] == '/') {
+                    return false;
+                }
+            }
+        }
+
+        if (!path[0]) {
+            return false;
+        }
+        if (pattern[0] == '?' ? path[0] == '/' : pattern[0] != path[0]) {
+            return false;
+        }
+        pattern++;
+        path++;
+    }
+}
+
+bool bake_coverage_path_matches(const char *pattern, const char *path) {
+    if (!pattern || !path) {
+        return false;
+    }
+    while (pattern[0] == '.' && pattern[1] == '/') {
+        pattern += 2;
+    }
+    if (bake_cov_has_glob(pattern)) {
+        return bake_cov_glob(pattern, path);
+    }
+
+    size_t len = strlen(pattern);
+    while (len && pattern[len - 1] == '/') {
+        len--;
+    }
+    if (!len) {
+        return false;
+    }
+    return !strncmp(path, pattern, len) && (path[len] == '\0' || path[len] == '/');
+}
+
+static void bake_cov_parse_patterns(const char *value, bake_strlist_t *out) {
+    bake_strlist_init(out);
+    if (!value) {
+        return;
+    }
+
+    const char *cur = value;
+    while (*cur) {
+        const char *end = strchr(cur, ',');
+        size_t len = end ? (size_t)(end - cur) : strlen(cur);
+        while (len && bake_char_is_space(*cur)) {
+            cur++;
+            len--;
+        }
+        while (len && bake_char_is_space(cur[len - 1])) {
+            len--;
+        }
+        if (len) {
+            char *pattern = ecs_os_malloc((ecs_size_t)len + 1);
+            memcpy(pattern, cur, len);
+            pattern[len] = '\0';
+            bake_strlist_append_owned(out, pattern);
+        }
+        if (!end) {
+            break;
+        }
+        cur = end + 1;
+    }
+}
+
+static int bake_cov_report_init(bake_cov_report_t *report, bake_context_t *ctx) {
+    memset(report, 0, sizeof(*report));
+    report->ctx = ctx;
+    ecs_vec_init_t(NULL, &report->projects, bake_cov_project_t, 0);
+    ecs_vec_init_t(NULL, &report->profiles, char*, 0);
+    ecs_vec_init_t(NULL, &report->files, bake_cov_file_t*, 0);
+    bake_cov_parse_patterns(ctx->opts.coverage_include, &report->include);
+    bake_cov_parse_patterns(ctx->opts.coverage_exclude, &report->exclude);
+
+    const char *root = ctx->opts.coverage_root;
+    if (!root || !root[0]) {
+        root = ctx->opts.cwd;
+    }
+    report->root = bake_path_is_abs(root)
+        ? ecs_os_strdup(root)
+        : bake_path_join(ctx->opts.cwd, root);
+    size_t len = strlen(report->root);
+    while (len > 1 && bake_path_is_sep(report->root[len - 1])) {
+        report->root[--len] = '\0';
+    }
+
+    if (!bake_path_is_dir(report->root)) {
+        ecs_err("coverage root '%s' is not a directory", report->root);
+        return -1;
+    }
+    report->root_resolved = bake_path_resolve(report->root);
+    return 0;
+}
+
+static char* bake_cov_relative_path(const bake_cov_report_t *report, const char *path) {
+    const char *roots[] = { report->root, report->root_resolved };
+    for (int32_t i = 0; i < 2; i++) {
+        size_t len = 0;
+        if (!roots[i] || !bake_path_has_prefix_normalized(path, roots[i], &len)) {
+            continue;
+        }
+        const char *rel = path + len;
+        while (*rel && bake_path_is_sep(*rel)) {
+            rel++;
+        }
+        if (*rel) {
+            return ecs_os_strdup(rel);
+        }
+    }
+    return ecs_os_strdup(path);
+}
+
+static bool bake_cov_path_selected(const bake_cov_report_t *report, const char *path) {
+    bool included = report->include.count == 0;
+    for (int32_t i = 0; !included && i < report->include.count; i++) {
+        included = bake_coverage_path_matches(report->include.items[i], path);
+    }
+    if (!included) {
+        return false;
+    }
+    for (int32_t i = 0; i < report->exclude.count; i++) {
+        if (bake_coverage_path_matches(report->exclude.items[i], path)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool bake_cov_is_profile(const char *name) {
@@ -323,20 +494,6 @@ static const char* bake_cov_fn_name(const char *name) {
     return sep ? sep + 1 : name;
 }
 
-static char* bake_cov_display_path(const char *path, const char *cwd) {
-    size_t len = 0;
-    if (cwd && bake_path_has_prefix_normalized(path, cwd, &len)) {
-        const char *rel = path + len;
-        while (*rel && bake_path_is_sep(*rel)) {
-            rel ++;
-        }
-        if (*rel) {
-            return ecs_os_strdup(rel);
-        }
-    }
-    return ecs_os_strdup(path);
-}
-
 static void bake_cov_add_totals(bake_cov_totals_t *dst, const bake_cov_totals_t *src) {
     dst->lines.count += src->lines.count;
     dst->lines.covered += src->lines.covered;
@@ -449,9 +606,12 @@ static int bake_cov_parse_lcov(bake_cov_report_t *report, const char *lcov_path)
             ecs_vec_init_t(NULL, &file->fns, bake_cov_fn_t, 0);
         } else if (!strcmp(line, "end_of_record")) {
             if (file && !bake_cov_excluded(report, file->path) &&
-                (file->totals.lines.count || file->totals.functions.count))
+                (report->keep_empty || file->totals.lines.count ||
+                    file->totals.functions.count))
             {
-                file->display = bake_cov_display_path(file->path, report->ctx->opts.cwd);
+                file->display = bake_cov_relative_path(report, file->path);
+            }
+            if (file && file->display && bake_cov_path_selected(report, file->display)) {
                 bake_cov_add_totals(&report->totals, &file->totals);
                 *ecs_vec_append_t(NULL, &report->files, bake_cov_file_t*) = file;
             } else if (file) {
@@ -697,20 +857,28 @@ static void bake_cov_json_ranges(ecs_strbuf_t *buf, const bake_cov_file_t *file)
     }
 }
 
-static int bake_cov_write_json(const bake_cov_report_t *report, const char *stamp) {
+static int bake_cov_write_json(
+    const bake_cov_report_t *report,
+    const char *stamp,
+    const char *path)
+{
     ecs_strbuf_t buf = ECS_STRBUF_INIT;
     ecs_strbuf_appendstr(&buf, "{\n  \"project\": ");
     bake_cov_json_cstr(&buf, report->title);
     ecs_strbuf_appendstr(&buf, ",\n  \"timestamp\": ");
     bake_cov_json_cstr(&buf, stamp);
-    ecs_strbuf_appendstr(&buf, ",\n  \"projects\": [");
-    int32_t project_count = ecs_vec_count(&report->projects);
-    const bake_cov_project_t *projects = ecs_vec_first_t(&report->projects, bake_cov_project_t);
-    for (int32_t i = 0; i < project_count; i++) {
-        if (i) ecs_strbuf_appendstr(&buf, ", ");
-        bake_cov_json_cstr(&buf, projects[i].cfg->id);
+    ecs_strbuf_appendstr(&buf, ",\n");
+    if (report->merged) {
+        ecs_strbuf_appendstr(&buf, "  \"projects\": [");
+        int32_t project_count = ecs_vec_count(&report->projects);
+        const bake_cov_project_t *projects = ecs_vec_first_t(
+            &report->projects, bake_cov_project_t);
+        for (int32_t i = 0; i < project_count; i++) {
+            if (i) ecs_strbuf_appendstr(&buf, ", ");
+            bake_cov_json_cstr(&buf, projects[i].cfg->id);
+        }
+        ecs_strbuf_appendstr(&buf, "],\n");
     }
-    ecs_strbuf_appendstr(&buf, "],\n");
     bake_cov_json_totals(&buf, "  ", &report->totals);
     ecs_strbuf_appendstr(&buf, ",\n  \"files\": [");
 
@@ -719,7 +887,7 @@ static int bake_cov_write_json(const bake_cov_report_t *report, const char *stam
     for (int32_t i = 0; i < file_count; i++) {
         const bake_cov_file_t *file = files[i];
         ecs_strbuf_appendstr(&buf, i ? ",\n    {\"file\": " : "\n    {\"file\": ");
-        bake_cov_json_cstr(&buf, file->path);
+        bake_cov_json_cstr(&buf, file->display);
         ecs_strbuf_appendstr(&buf, ",\n");
         bake_cov_json_totals(&buf, "     ", &file->totals);
         ecs_strbuf_appendstr(&buf, ",\n     \"uncovered_lines\": [");
@@ -742,9 +910,10 @@ static int bake_cov_write_json(const bake_cov_report_t *report, const char *stam
     ecs_strbuf_appendstr(&buf, file_count ? "\n  ]\n}\n" : "]\n}\n");
 
     char *content = ecs_strbuf_get(&buf);
-    char *path = bake_path_join(report->out_dir, "coverage.json");
     int rc = bake_file_write(path, content);
-    ecs_os_free(path);
+    if (rc != 0) {
+        ecs_err("failed to write coverage report '%s'", path);
+    }
     ecs_os_free(content);
     return rc;
 }
@@ -832,17 +1001,19 @@ static void bake_cov_print_summary(const bake_cov_report_t *report) {
 }
 
 int bake_coverage_report_generate(bake_context_t *ctx, const char *target_path) {
-    bake_cov_report_t report = { .ctx = ctx };
-    ecs_vec_init_t(NULL, &report.projects, bake_cov_project_t, 0);
-    ecs_vec_init_t(NULL, &report.profiles, char*, 0);
-    ecs_vec_init_t(NULL, &report.files, bake_cov_file_t*, 0);
-
+    bake_cov_report_t report;
     int rc = -1;
     char *root = NULL;
     char *profdata = NULL;
     char *lcov = NULL;
     char *files_dir = NULL;
+    char *json_path = NULL;
     const char *target_id = NULL;
+
+    if (bake_cov_report_init(&report, ctx) != 0) {
+        goto cleanup;
+    }
+    report.merged = true;
 
     if (target_path) {
         root = bake_path_resolve(target_path);
@@ -901,8 +1072,9 @@ int bake_coverage_report_generate(bake_context_t *ctx, const char *target_path) 
         }
     }
 
+    json_path = bake_path_join(report.out_dir, "coverage.json");
     if (bake_cov_write_index(&report, stamp) != 0 ||
-        bake_cov_write_json(&report, stamp) != 0)
+        bake_cov_write_json(&report, stamp, json_path) != 0)
     {
         goto cleanup;
     }
@@ -918,6 +1090,94 @@ cleanup:
     ecs_os_free(profdata);
     ecs_os_free(lcov);
     ecs_os_free(files_dir);
+    ecs_os_free(json_path);
+    bake_cov_report_fini(&report);
+    return rc;
+}
+
+static bool bake_cov_add_project(
+    bake_cov_report_t *report,
+    const bake_project_cfg_t *cfg,
+    const char *exe)
+{
+    const char *mode = report->ctx->opts.mode;
+    char *coverage_dir = bake_coverage_dir(cfg, mode);
+    int32_t found = coverage_dir
+        ? bake_cov_collect_profiles(report, coverage_dir)
+        : 0;
+    if (!found) {
+        ecs_err("no coverage data found in %s", coverage_dir ? coverage_dir : cfg->id);
+        ecs_os_free(coverage_dir);
+        return false;
+    }
+    ecs_os_free(coverage_dir);
+
+    bake_cov_project_t *project = ecs_vec_append_t(
+        NULL, &report->projects, bake_cov_project_t);
+    project->cfg = cfg;
+    project->exe = bake_path_resolve(exe);
+    if (!project->exe) {
+        project->exe = ecs_os_strdup(exe);
+    }
+    project->build_root = bake_project_build_root(cfg->path, cfg->id, mode);
+    project->resolved_path = bake_path_resolve(cfg->path);
+    return true;
+}
+
+int bake_coverage_project_report(
+    bake_context_t *ctx,
+    const bake_project_cfg_t *cfg,
+    const char *exe,
+    const char *json_path)
+{
+    bake_cov_report_t report;
+    int rc = -1;
+    char *coverage_dir = NULL;
+    char *profdata = NULL;
+    char *lcov = NULL;
+
+    if (bake_cov_report_init(&report, ctx) != 0) {
+        goto cleanup;
+    }
+    report.keep_empty = true;
+    report.title = ecs_os_strdup(cfg->id);
+
+    if (!bake_cov_add_project(&report, cfg, exe) ||
+        bake_coverage_init_tools(ctx) != 0)
+    {
+        goto cleanup;
+    }
+
+    coverage_dir = bake_coverage_dir(cfg, ctx->opts.mode);
+    profdata = bake_path_join(coverage_dir, "coverage.profdata");
+    lcov = bake_path_join(coverage_dir, "coverage.lcov");
+    if (bake_cov_merge_and_export(&report, profdata, lcov) != 0 ||
+        bake_cov_parse_lcov(&report, lcov) != 0)
+    {
+        goto cleanup;
+    }
+
+    char stamp[64] = {0};
+    bake_cov_timestamp(stamp, sizeof(stamp));
+    if (bake_cov_write_json(&report, stamp, json_path) != 0) {
+        goto cleanup;
+    }
+
+    const bake_cov_totals_t *t = &report.totals;
+    printf("coverage: %.2f%% lines (%lld/%lld), %.2f%% functions (%lld/%lld), "
+        "%.2f%% branches (%lld/%lld)\n",
+        bake_cov_percent(&t->lines),
+        (long long)t->lines.covered, (long long)t->lines.count,
+        bake_cov_percent(&t->functions),
+        (long long)t->functions.covered, (long long)t->functions.count,
+        bake_cov_percent(&t->branches),
+        (long long)t->branches.covered, (long long)t->branches.count);
+    rc = 0;
+
+cleanup:
+    ecs_os_free(coverage_dir);
+    ecs_os_free(profdata);
+    ecs_os_free(lcov);
     bake_cov_report_fini(&report);
     return rc;
 }

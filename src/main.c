@@ -164,6 +164,9 @@ int main(int argc, char *argv[]) {
         VARG("--run-prefix", run_prefix)
         VARG("--kill", ps_kill)
         VARG("--build-json", build_json)
+        VARG("--coverage-root", coverage_root)
+        VARG("--coverage-include", coverage_include)
+        VARG("--coverage-exclude", coverage_exclude)
 #undef VARG
 
         if (arg[0] == '-') {
@@ -236,6 +239,21 @@ int main(int argc, char *argv[]) {
         ecs_err("--coverage can only be used with the build, rebuild, run, "
             "test and bench commands");
         goto cleanup;
+    }
+
+    if (opts.coverage_root || opts.coverage_include || opts.coverage_exclude) {
+        const char *cmd = opts.command ? opts.command : "build";
+        bool writes_report = !strcmp(cmd, "run") || !strcmp(cmd, "test");
+        if (!writes_report && strcmp(cmd, "coverage-report")) {
+            ecs_err("--coverage-root, --coverage-include and --coverage-exclude "
+                "can only be used with the run, test and coverage-report commands");
+            goto cleanup;
+        }
+        if (writes_report && !opts.coverage) {
+            ecs_err("--coverage-root, --coverage-include and --coverage-exclude "
+                "require --coverage for the %s command", cmd);
+            goto cleanup;
+        }
     }
 
     bool repeat = opts.repeat > 0 || opts.warmup > 0;

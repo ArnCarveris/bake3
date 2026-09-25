@@ -2256,6 +2256,207 @@ class BakeTests(unittest.TestCase):
             cwd=root)
         self.assertFalse(coverage.exists())
 
+    def require_coverage_compiler(self) -> None:
+        if platform.system() == "Windows":
+            self.skipTest("coverage is not supported on Windows")
+        compiler = shutil.which("cc")
+        if not compiler:
+            self.skipTest("no C compiler available")
+        version = subprocess.run(
+            [compiler, "--version"], text=True, capture_output=True, check=False)
+        if "clang" not in (version.stdout or ""):
+            self.skipTest("coverage requires clang")
+
+    def write_coverage_workspace(self, name: str) -> tuple[Path, str]:
+        """Write a library with sources in src, src/util and include, and a test."""
+        stamp = int(time.time() * 1_000_000)
+        lib_id = f"tmp.tests.{name}.lib.{stamp}"
+        test_id = f"tmp.tests.{name}.test.{stamp}"
+        root = self.repo_root / "test" / "tmp" / f"{name}_{stamp}"
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        lib_dir = root / "lib"
+        test_dir = root / "test"
+        (lib_dir / "src" / "util").mkdir(parents=True, exist_ok=True)
+        (lib_dir / "include").mkdir(parents=True, exist_ok=True)
+        (test_dir / "src").mkdir(parents=True, exist_ok=True)
+
+        (lib_dir / "project.json").write_text(
+            json.dumps({"id": lib_id, "type": "package"}, indent=4) + "\n")
+        (lib_dir / "include" / "covlib.h").write_text(
+            "int covlib_sign(int x);\n"
+            "int covlib_unused(void);\n"
+            "int covlib_extra(int x);\n"
+            "static inline int covlib_twice(int x) {\n"
+            "    return x * 2;\n"
+            "}\n"
+        )
+        (lib_dir / "src" / "covlib.c").write_text(
+            "#include <covlib.h>\n"
+            "int covlib_sign(int x) {\n"
+            "    if (x > 0) {\n"
+            "        return 1;\n"
+            "    }\n"
+            "    return -1;\n"
+            "}\n"
+            "int covlib_unused(void) {\n"
+            "    return 42;\n"
+            "}\n"
+        )
+        (lib_dir / "src" / "util" / "extra.c").write_text(
+            "#include <covlib.h>\n"
+            "int covlib_extra(int x) {\n"
+            "    return x + 1;\n"
+            "}\n"
+        )
+        (test_dir / "project.json").write_text(
+            json.dumps(
+                {
+                    "id": test_id,
+                    "type": "test",
+                    "value": {"use": [lib_id]},
+                    "test": {
+                        "testsuites": [
+                            {"id": "Sign", "testcases": ["pos", "neg"]},
+                        ]
+                    },
+                },
+                indent=4,
+            ) + "\n"
+        )
+        (test_dir / "src" / "Sign.c").write_text(
+            "#include <bake_test.h>\n"
+            "#include <covlib.h>\n"
+            "void Sign_pos(void) { test_int(covlib_sign(3), 1); }\n"
+            "void Sign_neg(void) {\n"
+            "    test_int(covlib_sign(-3), -1);\n"
+            "    test_int(covlib_twice(covlib_extra(1)), 4);\n"
+            "}\n"
+        )
+        return root, test_id
+
+    def test_coverage_report_paths_are_relative_to_the_root(self) -> None:
+        self.require_coverage_compiler()
+        root, test_id = self.write_coverage_workspace("coverage_root")
+        local_env = "--local-env=coverage"
+        report = root / "report.json"
+        coverage = root / "report.coverage.json"
+
+        self.bake(
+            [local_env, "run", "test", "--coverage", "--", "--json", str(report)],
+            cwd=root)
+        data = json.loads(coverage.read_text())
+        self.assertEqual(data["project"], test_id)
+        self.assertNotIn("projects", data)
+        self.assertEqual(
+            [f["file"] for f in data["files"]],
+            ["lib/include/covlib.h", "lib/src/covlib.c", "lib/src/util/extra.c"])
+        for key in ("lines", "functions", "branches"):
+            for field in ("count", "covered"):
+                self.assertEqual(
+                    data[key][field],
+                    sum(f[key][field] for f in data["files"]))
+
+        self.bake(
+            [local_env, "run", "test", "--coverage", "--coverage-root", "lib",
+             "--", "--json", str(report)],
+            cwd=root)
+        data = json.loads(coverage.read_text())
+        self.assertEqual(
+            [f["file"] for f in data["files"]],
+            ["include/covlib.h", "src/covlib.c", "src/util/extra.c"])
+
+        self.bake(
+            [local_env, "run", "test", "--coverage", "--coverage-root",
+             str(root / "lib" / "src"), "--", "--json", str(report)],
+            cwd=root)
+        data = json.loads(coverage.read_text())
+        files = [f["file"] for f in data["files"]]
+        self.assertEqual(files[1:], ["covlib.c", "util/extra.c"])
+        self.assertTrue(Path(files[0]).is_absolute())
+        self.assertTrue(files[0].endswith("/lib/include/covlib.h"))
+
+        output = self.strip_ansi(self.bake_expect_failure(
+            [local_env, "run", "test", "--coverage", "--coverage-root", "missing",
+             "--", "--json", str(report)],
+            cwd=root))
+        self.assertIn("coverage root", output)
+        self.assertIn("is not a directory", output)
+
+    def test_coverage_report_filters_files_by_prefix_and_glob(self) -> None:
+        self.require_coverage_compiler()
+        root, test_id = self.write_coverage_workspace("coverage_filter")
+        local_env = "--local-env=coverage"
+        report = root / "report.json"
+        coverage = root / "report.coverage.json"
+
+        def run(*options: str) -> dict:
+            self.bake(
+                [local_env, "run", "test", "--coverage", *options,
+                 "--", "--json", str(report)],
+                cwd=root)
+            return json.loads(coverage.read_text())
+
+        full = run()
+        by_file = {f["file"]: f for f in full["files"]}
+
+        data = run("--coverage-include", "lib/src")
+        self.assertEqual(
+            [f["file"] for f in data["files"]],
+            ["lib/src/covlib.c", "lib/src/util/extra.c"])
+        for key in ("lines", "functions", "branches"):
+            for field in ("count", "covered"):
+                self.assertEqual(
+                    data[key][field],
+                    by_file["lib/src/covlib.c"][key][field] +
+                    by_file["lib/src/util/extra.c"][key][field])
+        self.assertEqual(data["lines"]["count"], 12)
+        self.assertEqual(data["lines"]["covered"], 9)
+        self.assertEqual(data["lines"]["percent"], 75.0)
+
+        data = run("--coverage-root", "lib", "--coverage-include", "src/,include",
+                   "--coverage-exclude", "src/util")
+        self.assertEqual(
+            [f["file"] for f in data["files"]],
+            ["include/covlib.h", "src/covlib.c"])
+
+        data = run("--coverage-include", "**/*.h,lib/src/*/*.c")
+        self.assertEqual(
+            [f["file"] for f in data["files"]],
+            ["lib/include/covlib.h", "lib/src/util/extra.c"])
+
+        data = run("--coverage-exclude", "lib/src/*.c")
+        self.assertEqual(
+            [f["file"] for f in data["files"]],
+            ["lib/include/covlib.h", "lib/src/util/extra.c"])
+
+        output = self.strip_ansi(self.bake(
+            [local_env, "coverage-report", "--coverage-root", "lib",
+             "--coverage-include", "src", "--coverage-exclude", "src/util/*"],
+            cwd=root))
+        self.assertIn(f"coverage of 1 test project: {test_id}", output)
+        self.assertRegex(output, r"\n  src\s+66\.67%\s+6/9")
+        self.assertNotIn("util", output)
+        self.assertNotIn("include", output)
+        report_dir = root / ".bake" / "local_env" / "coverage" / "coverage_report"
+        combined = json.loads((report_dir / "coverage.json").read_text())
+        self.assertEqual(combined["projects"], [test_id])
+        self.assertEqual([f["file"] for f in combined["files"]], ["src/covlib.c"])
+        self.assertEqual(combined["lines"], by_file["lib/src/covlib.c"]["lines"])
+        index = (report_dir / "index.html").read_text()
+        self.assertIn('"files": [\n["src/covlib.c",[6,9],[1,2],', index)
+
+    def test_coverage_report_options_are_validated(self) -> None:
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["build", "test/projects/c/app_helloworld", "--coverage",
+             "--coverage-include", "src"]))
+        self.assertIn(
+            "--coverage-root, --coverage-include and --coverage-exclude can only "
+            "be used with the run, test and coverage-report commands", output)
+
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["run", "test/projects/c/app_helloworld", "--coverage-root", "."]))
+        self.assertIn("require --coverage for the run command", output)
+
     def test_coverage_requires_clang(self) -> None:
         if platform.system() == "Windows":
             self.skipTest("coverage is not supported on Windows")

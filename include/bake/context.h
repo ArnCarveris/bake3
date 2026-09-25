@@ -18,6 +18,9 @@ typedef struct bake_options_t {
     const char *run_prefix;
     const char *ps_kill;
     const char *build_json;
+    const char *coverage_root;
+    const char *coverage_include;
+    const char *coverage_exclude;
     bool json;
     bool all_users;
     bool ps_full;

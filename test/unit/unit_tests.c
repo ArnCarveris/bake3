@@ -748,6 +748,27 @@ static void test_ps_shorten_path(void) {
     }
 }
 
+static void test_coverage_path_matches(void) {
+    CHECK(bake_coverage_path_matches("src", "src/a.c"));
+    CHECK(bake_coverage_path_matches("src/", "src/a/b.c"));
+    CHECK(bake_coverage_path_matches("./src", "src/a.c"));
+    CHECK(bake_coverage_path_matches("src/a.c", "src/a.c"));
+    CHECK(!bake_coverage_path_matches("src", "srcx/a.c"));
+    CHECK(!bake_coverage_path_matches("src", "include/src/a.c"));
+    CHECK(!bake_coverage_path_matches("", "src/a.c"));
+
+    CHECK(bake_coverage_path_matches("src/*.c", "src/a.c"));
+    CHECK(!bake_coverage_path_matches("src/*.c", "src/sub/a.c"));
+    CHECK(bake_coverage_path_matches("src/**", "src/sub/a.c"));
+    CHECK(bake_coverage_path_matches("src/**/*.c", "src/a.c"));
+    CHECK(bake_coverage_path_matches("src/**/*.c", "src/x/y/a.c"));
+    CHECK(!bake_coverage_path_matches("src/**/*.c", "src/x/a.h"));
+    CHECK(bake_coverage_path_matches("**/*.h", "include/a/b.h"));
+    CHECK(bake_coverage_path_matches("*/lib?.c", "src/lib1.c"));
+    CHECK(!bake_coverage_path_matches("*/lib?.c", "src/lib12.c"));
+    CHECK(!bake_coverage_path_matches("*.c", "src/a.c"));
+}
+
 int main(void) {
     ecs_os_init();
 
@@ -775,6 +796,7 @@ int main(void) {
     test_ps_kill_target_matching();
     test_ps_registry_roundtrip();
     test_ps_shorten_path();
+    test_coverage_path_matches();
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;
