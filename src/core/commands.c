@@ -43,6 +43,7 @@ static const char *bake_help_text =
     "  --local             Setup only: install into BAKE_HOME (skip /usr/local/bin)\n"
     "  --standalone        Use amalgamated dependency sources in deps/\n"
     "  --strict            Enable strict compiler warnings and checks\n"
+    "  --amalgamate <prefix> Build <prefix>.c/.h of the project as a shared library\n"
     "  --coverage          Build with coverage instrumentation (clang only)\n"
     "  --coverage-root <dir> Make coverage report paths relative to dir (default: cwd)\n"
     "  --coverage-include <patterns> Only report files matching a comma separated prefix or glob\n"

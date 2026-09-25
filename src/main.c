@@ -168,6 +168,7 @@ int main(int argc, char *argv[]) {
         VARG("--coverage-root", coverage_root)
         VARG("--coverage-include", coverage_include)
         VARG("--coverage-exclude", coverage_exclude)
+        VARG("--amalgamate", amalgamate)
 #undef VARG
 
         if (arg[0] == '-') {
@@ -234,6 +235,27 @@ int main(int argc, char *argv[]) {
         ecs_err("--build-json can only be used with the build, rebuild, run, "
             "test and bench commands");
         goto cleanup;
+    }
+
+    if (opts.amalgamate) {
+        const char *cmd = opts.command ? opts.command : "build";
+        if (strcmp(cmd, "build") && strcmp(cmd, "rebuild") &&
+            strcmp(cmd, "clean"))
+        {
+            ecs_err("--amalgamate can only be used with the build, rebuild "
+                "and clean commands");
+            goto cleanup;
+        }
+        if (!bake_amalgamate_prefix_valid(opts.amalgamate)) {
+            ecs_err("invalid --amalgamate prefix '%s' (use letters, digits, "
+                "'.', '_' or '-')", opts.amalgamate);
+            goto cleanup;
+        }
+        if (bake_target_name_is_em(opts.toolchain)) {
+            ecs_err("--amalgamate builds a shared library, which is not "
+                "supported for the em target");
+            goto cleanup;
+        }
     }
 
     if (opts.coverage && !bake_command_builds(opts.command)) {

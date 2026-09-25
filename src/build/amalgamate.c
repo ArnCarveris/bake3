@@ -1245,7 +1245,28 @@ cleanup:
     return rc;
 }
 
-int bake_generate_project_amalgamation(const bake_project_cfg_t *cfg) {
+char* bake_amalgamate_output_base(
+    const bake_project_cfg_t *cfg,
+    const bake_amalgamate_cfg_t *amalg)
+{
+    if (amalg->prefix && amalg->prefix[0]) {
+        return ecs_os_strdup(amalg->prefix);
+    }
+
+    char *project_id = NULL;
+    char *include_path = bake_path_join(cfg->path, "include");
+    char *main_header = bake_amalgamate_resolve_main_header(
+        cfg, include_path, &project_id);
+    ecs_os_free(main_header);
+    ecs_os_free(include_path);
+
+    return project_id ? project_id : bake_project_id_as_macro(cfg->id);
+}
+
+int bake_generate_project_amalgamation(
+    const bake_project_cfg_t *cfg,
+    const char *prefix)
+{
     if (!cfg) {
         return 0;
     }
@@ -1273,6 +1294,14 @@ int bake_generate_project_amalgamation(const bake_project_cfg_t *cfg) {
     rc = 0;
     for (int32_t i = 0; i < count; i++) {
         const bake_amalgamate_cfg_t *amalg = bake_amalgamate_list_get(&cfg->amalgamate, i);
+        if (prefix) {
+            const char *output_base =
+                (amalg->prefix && amalg->prefix[0]) ? amalg->prefix : project_id;
+            if (strcmp(output_base, prefix)) {
+                continue;
+            }
+        }
+
         if (bake_generate_one_amalgamation(
             cfg, project_id, include_path, src_path, main_header, amalg) != 0)
         {

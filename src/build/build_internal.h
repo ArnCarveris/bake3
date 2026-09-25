@@ -97,7 +97,20 @@ int bake_link_project_binary(
     bool *linked_out);
 
 int bake_amalgamate_project(const bake_project_cfg_t *cfg, const char *dst_dir);
-int bake_generate_project_amalgamation(const bake_project_cfg_t *cfg);
+int bake_generate_project_amalgamation(
+    const bake_project_cfg_t *cfg,
+    const char *prefix);
+char* bake_amalgamate_output_base(
+    const bake_project_cfg_t *cfg,
+    const bake_amalgamate_cfg_t *amalg);
+
+int bake_amalgamate_target_add(
+    bake_context_t *ctx,
+    const char *root,
+    char **target_out);
+int bake_amalgamate_target_stage(
+    bake_context_t *ctx,
+    bake_project_cfg_t *cfg);
 
 void bake_report_collect_loc(
     bake_context_t *ctx,

@@ -188,6 +188,16 @@ char* bake_project_cfg_artefact_name(const bake_project_cfg_t *cfg) {
         exe_ext = ".html";
     }
 
+    if (cfg->kind == BAKE_PROJECT_PACKAGE && cfg->shared_library) {
+#if defined(_WIN32)
+        return flecs_asprintf("%s.dll", cfg->output_name);
+#else
+        const char *shared_ext =
+            !strcmp(bake_target_os(), "Darwin") ? ".dylib" : ".so";
+        return flecs_asprintf("lib%s%s", cfg->output_name, shared_ext);
+#endif
+    }
+
     if (cfg->kind == BAKE_PROJECT_PACKAGE) {
         return flecs_asprintf("%s%s%s", lib_prefix, cfg->output_name, lib_ext);
     }
@@ -401,7 +411,18 @@ void bake_project_cfg_init(bake_project_cfg_t *cfg) {
 static void bake_project_cfg_fini_impl(bake_project_cfg_t *cfg, bool fini_dependee) {
 #define F(n) ecs_os_free(cfg->n)
     F(id); F(path); F(language); F(output_name); F(lint.command);
+    F(build_dir);
 #undef F
+
+    if (cfg->amalgamate_src) {
+        if (cfg->amalgamate_src->project) {
+            bake_project_cfg_fini(cfg->amalgamate_src->project);
+            ecs_os_free(cfg->amalgamate_src->project);
+        }
+        ecs_os_free(cfg->amalgamate_src->prefix);
+        ecs_os_free(cfg->amalgamate_src->dir);
+        ecs_os_free(cfg->amalgamate_src);
+    }
 
 #define F(n) bake_strlist_fini(&cfg->n)
     F(use); F(use_private);

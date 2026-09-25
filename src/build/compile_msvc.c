@@ -44,7 +44,8 @@ int bake_compose_compile_command_msvc(const bake_compile_cmd_ctx_t *ctx, ecs_str
 
 int bake_compose_link_command_msvc(const bake_link_cmd_ctx_t *ctx, ecs_strbuf_t *cmd) {
     bool is_lib = ctx->cfg->kind == BAKE_PROJECT_PACKAGE;
-    if (is_lib) {
+    bool is_shared = is_lib && ctx->cfg->shared_library;
+    if (is_lib && !is_shared) {
         ecs_strbuf_append(cmd, "lib /nologo /OUT:\"%s\"", ctx->artefact);
         for (int32_t i = 0; i < ctx->units->count; i++) {
             ecs_strbuf_append(cmd, " \"%s\"", ctx->units->items[i].obj);
@@ -57,6 +58,9 @@ int bake_compose_link_command_msvc(const bake_link_cmd_ctx_t *ctx, ecs_strbuf_t 
         : (ctx->ctx->opts.cc ? ctx->ctx->opts.cc : "cl");
 
     ecs_strbuf_append(cmd, "%s /nologo", linker);
+    if (is_shared) {
+        ecs_strbuf_appendstr(cmd, " /LD");
+    }
     for (int32_t i = 0; i < ctx->units->count; i++) {
         ecs_strbuf_append(cmd, " \"%s\"", ctx->units->items[i].obj);
     }

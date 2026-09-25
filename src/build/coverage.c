@@ -104,7 +104,7 @@ void bake_add_coverage_flags(
 }
 
 char* bake_coverage_dir(const bake_project_cfg_t *cfg, const char *mode) {
-    char *build_root = bake_project_build_root(cfg->path, cfg->id, mode);
+    char *build_root = bake_project_cfg_build_root(cfg, mode);
     if (!build_root) {
         return NULL;
     }

@@ -1,0 +1,17 @@
+{
+    "id":"examples.c.pkg_amalgamate_shared",
+    "type":"package",
+    "value": {
+        "amalgamate": [{
+            "path": "distr"
+        }, {
+            "path": "distr",
+            "prefix": "shared_mini",
+            "disable-flags": ["EXAMPLES_SHARED_EXTRA"]
+        }]
+    },
+    "lang.c": {
+        "defines": ["EXAMPLES_SHARED_PARENT_ONLY"],
+        "lib": ["m"]
+    }
+}

@@ -75,6 +75,13 @@ typedef struct bake_lint_cfg_t {
 
 typedef struct bake_project_cfg_t bake_project_cfg_t;
 
+typedef struct bake_amalgamate_src_t {
+    bake_project_cfg_t *project;
+    char *prefix;
+    char *dir;
+    bool generate;
+} bake_amalgamate_src_t;
+
 typedef struct bake_dependee_cfg_t {
     bake_project_cfg_t *cfg;
     char *json;
@@ -106,7 +113,10 @@ struct bake_project_cfg_t {
 
     bool private_project;
     bool standalone;
+    bool shared_library;
+    char *build_dir;
     bake_amalgamate_list_t amalgamate;
+    bake_amalgamate_src_t *amalgamate_src;
 
     bake_strlist_t use;
     bake_strlist_t use_private;

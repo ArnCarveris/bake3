@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import ctypes
 import json
 import os
 import platform
@@ -434,6 +435,260 @@ class BakeTests(unittest.TestCase):
         self.assertNotIn("EXAMPLES_FLAG_OFF", regenerated)
         self.assertNotIn("EXAMPLES_FEATURE_REMOVED", regenerated)
         self.assertEqual(regenerated, stripped)
+
+    def copy_amalgamate_shared_project(self, name: str) -> Path:
+        stamp = int(time.time() * 1_000_000)
+        project_dir = self.repo_root / "test" / "tmp" / f"{name}_{stamp}"
+        self.addCleanup(shutil.rmtree, project_dir, ignore_errors=True)
+        shutil.copytree(
+            self.repo_root / "test" / "projects" / "c" / "pkg_amalgamate_shared",
+            project_dir,
+            ignore=shutil.ignore_patterns(".bake"),
+        )
+        return project_dir
+
+    @staticmethod
+    def shared_library_name(output: str) -> str:
+        if platform.system() == "Windows":
+            return f"{output}.dll"
+        if platform.system() == "Darwin":
+            return f"lib{output}.dylib"
+        return f"lib{output}.so"
+
+    def amalgamate_build_root(self, gen_dir: Path, cfg: str = "debug") -> Path:
+        return gen_dir / f"{self.host_arch()}-{platform.system()}-{cfg}"
+
+    def test_amalgamate_option_builds_shared_library(self) -> None:
+        project_dir = self.copy_amalgamate_shared_project("amalg_shared")
+        gen_dir = project_dir / ".bake" / "amalgamate" / "shared_mini"
+
+        output = self.strip_ansi(
+            self.bake(["--amalgamate", "shared_mini"], cwd=project_dir))
+        self.assertIn("package shared_mini => '.bake/amalgamate/shared_mini'", output)
+
+        library = self.amalgamate_build_root(gen_dir) / self.shared_library_name("shared_mini")
+        self.assertTrue(library.is_file(), f"Expected shared library at {library}")
+        self.assertEqual(
+            sorted(p.name for p in (gen_dir / "src").iterdir()),
+            ["shared_mini.c", "shared_mini.h"])
+        self.assertTrue((gen_dir / "project.json").is_file())
+
+        staged_header = (gen_dir / "src" / "shared_mini.h").read_text()
+        self.assertTrue(staged_header.startswith(
+            "// Comment out this line when using as DLL\n"
+            "// #define examples_c_pkg_amalgamate_shared_STATIC\n"))
+        self.assertTrue((project_dir / "distr" / "shared_mini.h").read_text().startswith(
+            "// Comment out this line when using as DLL\n"
+            "#define examples_c_pkg_amalgamate_shared_STATIC\n"))
+
+        lib = ctypes.CDLL(str(library))
+        self.assertEqual(lib.examples_shared_value(), 42)
+        self.assertFalse(hasattr(lib, "examples_shared_extra"))
+
+        self.assertEqual(
+            list(project_dir.glob(".bake/*/libpkg_amalgamate_shared*")), [],
+            "The parent project must not be built")
+        self.assertNotIn("shared_mini", self.list_state().package_names)
+        self.assertNotIn("examples.c.pkg_amalgamate_shared", self.list_state().package_names)
+        self.assertEqual(
+            sorted(p.name for p in project_dir.iterdir()),
+            [".bake", "distr", "include", "project.json", "src"])
+
+        again = self.strip_ansi(
+            self.bake(["--amalgamate", "shared_mini"], cwd=project_dir))
+        self.assertNotRegex(again, r"\d+%\]")
+
+    def test_amalgamate_option_compiles_like_a_standalone_consumer(self) -> None:
+        project_dir = self.copy_amalgamate_shared_project("amalg_flags")
+
+        output = self.strip_ansi(self.bake(
+            ["--amalgamate", "examples_c_pkg_amalgamate_shared", "--trace"],
+            cwd=project_dir))
+
+        compile_lines = [line for line in output.splitlines()
+                         if " -c " in line and "examples_c_pkg_amalgamate_shared.c" in line]
+        self.assertEqual(len(compile_lines), 1, output)
+        compile_line = compile_lines[0]
+        self.assertIn("-Dexamples_c_pkg_amalgamate_shared_EXPORTS", compile_line)
+        self.assertNotIn("EXAMPLES_SHARED_PARENT_ONLY", compile_line)
+        if platform.system() != "Windows":
+            self.assertIn("-fPIC", compile_line)
+
+        library_name = self.shared_library_name("examples_c_pkg_amalgamate_shared")
+        link_lines = [line for line in output.splitlines()
+                      if library_name in line and " -c " not in line]
+        self.assertEqual(len(link_lines), 1, output)
+        self.assertIn("-lm", link_lines[0])
+
+        gen_dir = project_dir / ".bake" / "amalgamate" / "examples_c_pkg_amalgamate_shared"
+        lib = ctypes.CDLL(str(self.amalgamate_build_root(gen_dir) / library_name))
+        self.assertEqual(lib.examples_shared_value(), 42)
+        self.assertEqual(lib.examples_shared_extra(), 7)
+
+    def test_amalgamate_option_regenerates_stale_amalgamation(self) -> None:
+        project_dir = self.copy_amalgamate_shared_project("amalg_stale")
+        distr_source = project_dir / "distr" / "shared_mini.c"
+        expected = distr_source.read_text()
+        distr_source.write_text(expected.replace("return 42;", "return 1;"))
+
+        self.bake(["--amalgamate", "shared_mini"], cwd=project_dir)
+
+        self.assertEqual(distr_source.read_text(), expected)
+        gen_dir = project_dir / ".bake" / "amalgamate" / "shared_mini"
+        lib = ctypes.CDLL(str(
+            self.amalgamate_build_root(gen_dir) / self.shared_library_name("shared_mini")))
+        self.assertEqual(lib.examples_shared_value(), 42)
+
+    def test_amalgamate_option_rebuild_and_clean(self) -> None:
+        project_dir = self.copy_amalgamate_shared_project("amalg_clean")
+        amalg_root = project_dir / ".bake" / "amalgamate"
+
+        self.bake(["--amalgamate", "shared_mini", str(project_dir)])
+        output = self.strip_ansi(self.bake(
+            ["rebuild", "--amalgamate", "examples_c_pkg_amalgamate_shared",
+             str(project_dir)]))
+        self.assertIn("clean] examples_c_pkg_amalgamate_shared", output)
+        self.assertIn("rebuild] package examples_c_pkg_amalgamate_shared", output)
+
+        full = amalg_root / "examples_c_pkg_amalgamate_shared"
+        mini = amalg_root / "shared_mini"
+        self.assertTrue((self.amalgamate_build_root(full) / self.shared_library_name(
+            "examples_c_pkg_amalgamate_shared")).is_file())
+
+        output = self.strip_ansi(self.bake(
+            ["rebuild", "--amalgamate", "shared_mini", str(project_dir)]))
+        self.assertRegex(output, r"\d+%\] shared_mini\.c")
+
+        self.bake(["clean", "--amalgamate", "shared_mini", str(project_dir)])
+        self.assertFalse(mini.exists())
+        self.assertTrue(full.is_dir())
+
+        self.bake(["clean", "--amalgamate", "examples_c_pkg_amalgamate_shared"],
+                  cwd=project_dir)
+        self.assertFalse(amalg_root.exists())
+        self.assertTrue((project_dir / "distr" / "shared_mini.c").is_file())
+
+    def test_amalgamate_option_release_build_json(self) -> None:
+        project_dir = self.copy_amalgamate_shared_project("amalg_json")
+        report_path = project_dir / "report.json"
+
+        self.bake(
+            ["rebuild", "--amalgamate", "shared_mini", "--cfg", "release",
+             "--build-json", str(report_path)],
+            cwd=project_dir)
+
+        gen_dir = project_dir / ".bake" / "amalgamate" / "shared_mini"
+        self.assertTrue((self.amalgamate_build_root(gen_dir, "release") /
+                         self.shared_library_name("shared_mini")).is_file())
+        self.assertFalse(self.amalgamate_build_root(gen_dir, "debug").exists())
+
+        report = json.loads(report_path.read_text())
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["cfg"], "release")
+        self.assertEqual(list(report["totals"]["project"]), ["shared_mini"])
+
+        steps = self.report_steps(report)
+        amalg_steps = [step for step in steps
+                       if step["kind"] == "generate" and step["name"] == "amalgamate"]
+        self.assertEqual([step["project"] for step in amalg_steps], ["shared_mini"])
+
+        compiles = [step for step in steps if step["kind"] == "compile"]
+        self.assertEqual([step["name"] for step in compiles], ["src/shared_mini.c"])
+        self.assertEqual(compiles[0]["project"], "shared_mini")
+        links = [step for step in steps if step["kind"] == "link"]
+        self.assertEqual([step["project"] for step in links], ["shared_mini"])
+
+        project_totals = report["totals"]["project"]["shared_mini"]
+        self.assertEqual(project_totals["files"], 1)
+        self.assertGreater(project_totals["link_sec"], 0.0)
+        if shutil.which("cloc"):
+            self.assertEqual(
+                sorted(project_totals["loc"]["by_file"]),
+                ["src/shared_mini.c", "src/shared_mini.h"])
+            self.assertGreater(project_totals["loc"]["code"], 0)
+
+    def test_amalgamate_option_uses_files_in_the_project_root(self) -> None:
+        project_dir, _ = self.write_simple_app_project(
+            "amalg_root_files", "int main(void) { return 0; }\n")
+        (project_dir / "rootlib.h").write_text("int rootlib_value(void);\n")
+        (project_dir / "rootlib.c").write_text(
+            '#include "rootlib.h"\nint rootlib_value(void) { return 5; }\n')
+
+        self.bake(["--amalgamate", "rootlib"], cwd=project_dir)
+
+        gen_dir = project_dir / ".bake" / "amalgamate" / "rootlib"
+        lib = ctypes.CDLL(str(
+            self.amalgamate_build_root(gen_dir) / self.shared_library_name("rootlib")))
+        self.assertEqual(lib.rootlib_value(), 5)
+        self.assertEqual(
+            sorted(p.name for p in (gen_dir / "src").iterdir()),
+            ["rootlib.c", "rootlib.h"])
+
+    def test_amalgamate_option_local_env_does_not_collide_with_parent(self) -> None:
+        project_dir, _ = self.write_simple_app_project(
+            "amalg_same", "int main(void) { return 0; }\n")
+        (project_dir / "src" / "main.c").write_text(
+            '#include "amalg_same.h"\nint amalg_same_value(void) { return 3; }\n')
+        (project_dir / "include").mkdir()
+        (project_dir / "include" / "amalg_same.h").write_text(
+            "int amalg_same_value(void);\n")
+        (project_dir / "project.json").write_text(
+            '{\n'
+            '    "id": "amalg_same",\n'
+            '    "type": "package",\n'
+            '    "value": {"amalgamate": [{"path": "distr"}]}\n'
+            '}\n')
+
+        self.bake(["build", "--local-env=amalg"], cwd=project_dir)
+        self.bake(["--amalgamate", "amalg_same", "--local-env=amalg"], cwd=project_dir)
+
+        build_root = project_dir / ".bake" / "local_env" / "amalg" / "build" / "amalg_same"
+        static_lib = self.amalgamate_build_root(build_root) / (
+            "amalg_same.lib" if platform.system() == "Windows" else "libamalg_same.a")
+        gen_dir = build_root / "amalgamate" / "amalg_same"
+        shared_lib = self.amalgamate_build_root(gen_dir) / self.shared_library_name("amalg_same")
+        self.assertTrue(static_lib.is_file(), f"Expected parent library at {static_lib}")
+        self.assertTrue(shared_lib.is_file(), f"Expected shared library at {shared_lib}")
+        self.assertFalse((project_dir / ".bake" / "amalgamate").exists())
+        self.assertEqual(ctypes.CDLL(str(shared_lib)).amalg_same_value(), 3)
+
+        self.bake(["clean", "--amalgamate", "amalg_same", "--local-env=amalg"],
+                  cwd=project_dir)
+        self.assertFalse(gen_dir.exists())
+        self.assertTrue(static_lib.is_file())
+
+    def test_amalgamate_option_is_validated(self) -> None:
+        project_dir = self.copy_amalgamate_shared_project("amalg_errors")
+
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["--amalgamate", "missing"], cwd=project_dir))
+        self.assertIn("cannot build amalgamation 'missing'", output)
+        self.assertIn(
+            "available prefixes: examples_c_pkg_amalgamate_shared, shared_mini", output)
+
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["--amalgamate", "../escape"], cwd=project_dir))
+        self.assertIn("invalid --amalgamate prefix", output)
+
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["run", "--amalgamate", "shared_mini"], cwd=project_dir))
+        self.assertIn("--amalgamate can only be used with the build, rebuild and clean", output)
+
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["--amalgamate", "shared_mini", "no_such_dir"], cwd=project_dir))
+        self.assertIn("--amalgamate requires a project directory", output)
+
+        (project_dir / "empty").mkdir()
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["--amalgamate", "shared_mini", "empty"], cwd=project_dir))
+        self.assertIn("no project.json in", output)
+
+        plain_dir, _ = self.write_simple_app_project(
+            "amalg_unconfigured", "int main(void) { return 0; }\n")
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["--amalgamate", "plain"], cwd=plain_dir))
+        self.assertIn("does not configure amalgamation", output)
+        self.assertFalse((plain_dir / ".bake" / "amalgamate").exists())
 
     def test_build_distinguishes_sources_with_colliding_flat_names(self) -> None:
         self.bake(["build", "test/projects/c/app_obj_collision"])

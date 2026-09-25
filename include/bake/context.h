@@ -21,6 +21,7 @@ typedef struct bake_options_t {
     const char *coverage_root;
     const char *coverage_include;
     const char *coverage_exclude;
+    const char *amalgamate;
     bool json;
     bool all_users;
     bool ps_full;

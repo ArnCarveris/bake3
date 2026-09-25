@@ -372,7 +372,7 @@ static int bake_cov_collect_projects(
                 continue;
             }
 
-            char *build_root = bake_project_build_root(cfg->path, cfg->id, mode);
+            char *build_root = bake_project_cfg_build_root(cfg, mode);
             char *artefact = bake_project_cfg_artefact_name(cfg);
             char *exe = build_root && artefact
                 ? bake_path_join(build_root, artefact)
@@ -1422,7 +1422,7 @@ static bool bake_cov_add_project(
     if (!project->exe) {
         project->exe = ecs_os_strdup(exe);
     }
-    project->build_root = bake_project_build_root(cfg->path, cfg->id, mode);
+    project->build_root = bake_project_cfg_build_root(cfg, mode);
     project->resolved_path = bake_path_resolve(cfg->path);
     return true;
 }
