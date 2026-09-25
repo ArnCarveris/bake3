@@ -36,6 +36,8 @@ static const char *bake_help_text =
     "  --full              ps only: print untruncated workspace and command columns\n"
     "  --kill <pid|env>    ps only: stop a listed process, environment or env kind\n"
     "  --build-json <file> Write a json report of the build with per step timings\n"
+    "  --repeat <n>        Build/rebuild only: run the build n times, keep the median report\n"
+    "  --warmup <n>        Build/rebuild only: unmeasured runs before --repeat runs\n"
     "  --port <n>          First port for the 'run --target em' web server (default 8080)\n"
     "  --local-env[=<name>] Use ./.bake/local_env (or ./.bake/local_env/<name>) as isolated BAKE_HOME and build root\n"
     "  --local             Setup only: install into BAKE_HOME (skip /usr/local/bin)\n"

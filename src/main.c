@@ -113,6 +113,26 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
+        if (!strcmp(arg, "--repeat") || !strcmp(arg, "--warmup")) {
+            if ((i + 1) >= argc) {
+                ecs_err("missing value for %s", arg);
+                goto cleanup;
+            }
+            bool is_repeat = !strcmp(arg, "--repeat");
+            char *end = NULL;
+            long count = strtol(argv[++i], &end, 10);
+            if (count < (is_repeat ? 1 : 0) || count > 10000 || !end || *end) {
+                ecs_err("invalid value for %s: %s", arg, argv[i]);
+                goto cleanup;
+            }
+            if (is_repeat) {
+                opts.repeat = (int32_t)count;
+            } else {
+                opts.warmup = (int32_t)count;
+            }
+            continue;
+        }
+
         if (!strcmp(arg, "--port")) {
             if ((i + 1) >= argc) {
                 ecs_err("missing value for --port");
@@ -193,26 +213,6 @@ int main(int argc, char *argv[]) {
         if (!opts.cxx) opts.cxx = "em++";
     }
 
-    if (opts.local_env) {
-        const char *existing_bake_home = getenv("BAKE_HOME");
-        if (existing_bake_home && existing_bake_home[0]) {
-            bake_os_setenv("BAKE_GLOBAL_HOME", existing_bake_home);
-        } else {
-            bake_os_unsetenv("BAKE_GLOBAL_HOME");
-        }
-
-        local_bake_home = bake_local_env_home(cwd, local_env_name);
-        if (!local_bake_home) {
-            ecs_err("failed to resolve local bake environment path");
-            goto cleanup;
-        }
-        bake_os_setenv("BAKE_HOME", local_bake_home);
-        bake_os_setenv("BAKE_LOCAL_ENV", "1");
-    } else {
-        bake_os_setenv("BAKE_LOCAL_ENV", "0");
-        bake_os_unsetenv("BAKE_GLOBAL_HOME");
-    }
-
     if (opts.setup_local && strcmp(opts.command, "setup")) {
         ecs_err("--local can only be used with the setup command");
         goto cleanup;
@@ -236,6 +236,42 @@ int main(int argc, char *argv[]) {
         ecs_err("--coverage can only be used with the build, rebuild, run, "
             "test and bench commands");
         goto cleanup;
+    }
+
+    bool repeat = opts.repeat > 0 || opts.warmup > 0;
+    if (repeat) {
+        const char *cmd = opts.command ? opts.command : "build";
+        if (strcmp(cmd, "build") && strcmp(cmd, "rebuild")) {
+            ecs_err("--repeat and --warmup can only be used with the build and "
+                "rebuild commands");
+            goto cleanup;
+        }
+        if (!opts.build_json) {
+            ecs_err("--repeat and --warmup require --build-json");
+            goto cleanup;
+        }
+        rc = bake_repeat_build(&opts, argc, argv) == 0 ? 0 : 1;
+        goto cleanup;
+    }
+
+    if (opts.local_env) {
+        const char *existing_bake_home = getenv("BAKE_HOME");
+        if (existing_bake_home && existing_bake_home[0]) {
+            bake_os_setenv("BAKE_GLOBAL_HOME", existing_bake_home);
+        } else {
+            bake_os_unsetenv("BAKE_GLOBAL_HOME");
+        }
+
+        local_bake_home = bake_local_env_home(cwd, local_env_name);
+        if (!local_bake_home) {
+            ecs_err("failed to resolve local bake environment path");
+            goto cleanup;
+        }
+        bake_os_setenv("BAKE_HOME", local_bake_home);
+        bake_os_setenv("BAKE_LOCAL_ENV", "1");
+    } else {
+        bake_os_setenv("BAKE_LOCAL_ENV", "0");
+        bake_os_unsetenv("BAKE_GLOBAL_HOME");
     }
 
     if (bake_context_init(&ctx, &opts) != 0) {

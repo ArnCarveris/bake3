@@ -3164,6 +3164,123 @@ class BakeTests(unittest.TestCase):
         self.assertFalse(loc_steps[0]["ok"])
         self.assertEqual(loc_steps[0]["error"], "cloc not found")
 
+    def test_build_json_repeat_keeps_the_median_run(self) -> None:
+        project_dir, app_id = self.write_build_json_app("build_json_repeat")
+        report_path = project_dir / "reports" / "build.json"
+
+        output = self.strip_ansi(self.bake(
+            ["rebuild", str(project_dir), "--repeat", "3", "--warmup", "1",
+             "--build-json", str(report_path)]))
+        self.assertEqual(output.count("clean] "), 4)
+        self.assertIn("[ repeat] median of 3 runs", output)
+
+        report = json.loads(report_path.read_text())
+        self.assertTrue(report["ok"])
+        self.assertEqual(
+            sorted(p.name for p in report_path.parent.iterdir()), ["build.json"])
+
+        repeat = report["repeat"]
+        self.assertEqual(repeat["warmup"], 1)
+        self.assertEqual(repeat["count"], 3)
+        runs = repeat["runs"]
+        self.assertEqual([run["run"] for run in runs], [0, 1, 2, 3])
+        self.assertEqual(
+            [run["warmup"] for run in runs], [True, False, False, False])
+        for run in runs:
+            self.assertTrue(run["ok"])
+            self.assertEqual(run["exit_code"], 0)
+            self.assertGreater(run["total_sec"], 0.0)
+        for run in runs[1:]:
+            self.assertEqual(run["loc_sec"], 0)
+
+        measured = sorted(run["total_sec"] - run["loc_sec"] for run in runs[1:])
+        self.assertAlmostEqual(repeat["median_sec"], measured[1], places=6)
+        chosen = runs[repeat["chosen_run"]]
+        self.assertFalse(chosen["warmup"])
+        self.assertAlmostEqual(chosen["total_sec"], report["total_sec"], places=6)
+        self.assertAlmostEqual(
+            chosen["total_sec"] - chosen["loc_sec"], repeat["median_sec"], places=6)
+
+        steps = self.report_steps(report)
+        self.assertEqual([step for step in steps if step["kind"] == "loc"], [])
+        self.assertEqual(report["totals"]["kind"]["loc"], 0)
+        self.assertEqual(
+            sorted(step["name"] for step in steps if step["kind"] == "compile"),
+            ["src/helper.c", "src/main.c"])
+        self.assertEqual(report["totals"]["project"][app_id]["files"], 2)
+
+        if shutil.which("cloc"):
+            self.assertGreater(runs[0]["loc_sec"], 0.0)
+            project_loc = report["totals"]["project"][app_id]["loc"]
+            self.assertEqual(project_loc["files"], 2)
+            self.assertEqual(
+                sorted(project_loc["by_file"]), ["src/helper.c", "src/main.c"])
+            self.assertEqual(report["totals"]["loc"]["files"], 2)
+
+    def test_build_json_repeat_without_warmup_counts_loc_once(self) -> None:
+        project_dir, app_id = self.write_build_json_app("build_json_repeat_nowarm")
+        report_path = project_dir / "build.json"
+
+        self.bake(
+            ["build", str(project_dir), "--repeat", "2",
+             "--build-json", str(report_path)])
+
+        report = json.loads(report_path.read_text())
+        self.assertTrue(report["ok"])
+        repeat = report["repeat"]
+        self.assertEqual((repeat["warmup"], repeat["count"]), (0, 2))
+        runs = repeat["runs"]
+        self.assertEqual([run["warmup"] for run in runs], [False, False])
+        self.assertEqual(runs[1]["loc_sec"], 0)
+        self.assertIn(repeat["chosen_run"], (0, 1))
+        measured = sorted(run["total_sec"] - run["loc_sec"] for run in runs)
+        self.assertAlmostEqual(repeat["median_sec"], measured[0], places=6)
+        self.assertAlmostEqual(
+            report["total_sec"] - report["totals"]["kind"]["loc"],
+            repeat["median_sec"], places=6)
+        if shutil.which("cloc"):
+            self.assertGreater(runs[0]["loc_sec"], 0.0)
+            self.assertEqual(report["totals"]["project"][app_id]["loc"]["files"], 2)
+
+    def test_build_json_repeat_stops_at_a_failing_run(self) -> None:
+        project_dir, _ = self.write_simple_app_project(
+            "build_json_repeat_failure",
+            "int main(void) { this is not c }\n",
+        )
+        report_path = project_dir / "build.json"
+
+        self.bake_expect_failure(
+            ["rebuild", str(project_dir), "--repeat", "3", "--warmup", "1",
+             "--build-json", str(report_path)])
+
+        report = json.loads(report_path.read_text())
+        self.assertFalse(report["ok"])
+        self.assertIsNone(report["repeat"]["chosen_run"])
+        runs = report["repeat"]["runs"]
+        self.assertEqual(len(runs), 1)
+        self.assertFalse(runs[0]["ok"])
+        self.assertNotEqual(runs[0]["exit_code"], 0)
+        self.assertEqual(
+            sorted(p.name for p in project_dir.glob("build.json*")), ["build.json"])
+
+    def test_build_json_repeat_is_validated(self) -> None:
+        report_path = self.repo_root / "test" / "tmp" / "unused_repeat_report.json"
+
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["run", "test/projects/c/app_helloworld", "--repeat", "2",
+             "--build-json", str(report_path)]))
+        self.assertIn("--repeat and --warmup can only be used with", output)
+
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["build", "test/projects/c/app_helloworld", "--repeat", "2"]))
+        self.assertIn("--repeat and --warmup require --build-json", output)
+
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["build", "test/projects/c/app_helloworld", "--repeat", "0",
+             "--build-json", str(report_path)]))
+        self.assertIn("invalid value for --repeat", output)
+        self.assertFalse(report_path.exists())
+
     def test_setup_local_reinstalls_executable_bake_binary(self) -> None:
         installed_bake = self.bake_home / f"bake3{EXE_SUFFIX}"
         self.assertTrue(installed_bake.is_file(), f"Expected installed bake binary at {installed_bake}")

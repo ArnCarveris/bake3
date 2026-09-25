@@ -117,6 +117,8 @@ Options:
   --full              ps only: print untruncated workspace and command columns
   --kill <pid|env>    ps only: stop a listed process, environment or env kind
   --build-json <file> Write a json report of the build with per step timings
+  --repeat <n>        Build/rebuild only: run the build n times, keep the median report
+  --warmup <n>        Build/rebuild only: unmeasured runs before --repeat runs
   --local-env[=<name>] Use ./.bake/local_env (or ./.bake/local_env/<name>) as isolated BAKE_HOME and build root
   --local             Setup only: install into BAKE_HOME (skip /usr/local/bin)
   --standalone        Use amalgamated dependency sources in deps/
@@ -1091,6 +1093,9 @@ clock start and duration, so sibling compiles overlap.
   part of the link, so that step records what is embedded and only times the
   arguments bake composes for it.
 - `etc`: the install of the project's `etc` folder into the bake environment.
+- `loc`: the lines of code of a project, counted with `cloc` when it is
+  installed. The counts are reported in `totals.project.<id>.loc` and
+  `totals.loc`. Set `BAKE_BUILD_REPORT_LOC=0` to skip the count.
 
 ### Totals
 `totals` repeats the same numbers in aggregated form, so a page can show
@@ -1105,6 +1110,52 @@ of the build.
 `totals.project` holds one entry per project: `total_sec` (the time of the
 steps bake spent on that project, which includes its bundles), `compile_sec`,
 `link_sec` and `files`, the number of source files that were compiled.
+
+### Repeated builds
+`--repeat <n>` runs a `build` or `rebuild` `n` times and writes the report of
+the median run to `--build-json`, which it requires. `--warmup <n>` adds `n`
+runs before them that are not measured, so caches are warm when the measured
+runs start. `--warmup` without `--repeat` measures a single run:
+
+```sh
+bake3 rebuild --local-env --repeat 3 --warmup 1 -j 1 --build-json /tmp/build.json
+```
+
+Every run is a separate bake invocation with the same arguments, so each one
+does its own discovery, clean and build, exactly like running the command `n`
+times. The runs are compared by `total_sec` minus `totals.kind.loc`: lines of
+code are only counted in the first run (the first warm-up when there is one),
+and the counts of that run are copied into the reported one. When the reported
+run is not the first run, it has no `loc` step and `totals.kind.loc` is 0, so
+`total_sec - totals.kind.loc` is the build time of the run in both cases. With
+an even count the lower of the two middle runs is the median.
+
+The report gets a `repeat` object:
+
+```json
+"repeat": {
+  "warmup": 1,
+  "count": 3,
+  "chosen_run": 2,
+  "median_sec": 5.106315,
+  "runs": [
+    {"run": 0, "warmup": true, "ok": true, "exit_code": 0, "total_sec": 5.342540, "loc_sec": 0.217835},
+    {"run": 1, "warmup": false, "ok": true, "exit_code": 0, "total_sec": 5.113472, "loc_sec": 0},
+    {"run": 2, "warmup": false, "ok": true, "exit_code": 0, "total_sec": 5.106315, "loc_sec": 0},
+    {"run": 3, "warmup": false, "ok": true, "exit_code": 0, "total_sec": 5.138264, "loc_sec": 0}
+  ]
+}
+```
+
+- `warmup`, `count`: the `--warmup` and `--repeat` values.
+- `chosen_run`: index in `runs` of the run the report describes.
+- `median_sec`: the median of `total_sec - loc_sec` over the measured runs.
+- `runs`: every run in the order it ran, with its exit code, `total_sec` and
+  the time it spent counting lines of code.
+
+The repetition stops at the first run that fails. The report of that run is
+written with `chosen_run` and `median_sec` set to `null`, and bake exits with
+an error.
 
 ## Project discovery
 When bake is called on a directory, it will recursively discover all other bake projects in that directory. A bake project is identified as a project with a `project.json`. The command specified on the bake command line will then be executed for all discovered projects.

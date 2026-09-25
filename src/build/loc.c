@@ -378,6 +378,11 @@ void bake_report_collect_loc(
         return;
     }
 
+    const char *enabled = getenv("BAKE_BUILD_REPORT_LOC");
+    if (enabled && !strcmp(enabled, "0")) {
+        return;
+    }
+
     const char *tmpdir = getenv("TMPDIR");
     if (!tmpdir || !tmpdir[0]) {
         tmpdir = "/tmp";

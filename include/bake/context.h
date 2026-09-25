@@ -31,6 +31,8 @@ typedef struct bake_options_t {
     bool local_env;
     int32_t jobs;
     int32_t port;
+    int32_t repeat;
+    int32_t warmup;
     int run_argc;
     const char **run_argv;
 } bake_options_t;
