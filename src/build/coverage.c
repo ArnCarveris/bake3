@@ -32,7 +32,7 @@ static char* bake_coverage_capture(
     return output;
 }
 
-static char* bake_coverage_tool(const bake_context_t *ctx, const char *tool) {
+char* bake_coverage_tool(const bake_context_t *ctx, const char *tool) {
     char *arg = flecs_asprintf("-print-prog-name=%s", tool);
     const char *argv[] = { bake_coverage_cc(ctx), arg, NULL };
     char *path = bake_coverage_capture(ctx, argv);

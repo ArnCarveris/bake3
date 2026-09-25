@@ -47,6 +47,7 @@ static const char *bake_help_text =
     "  --coverage-root <dir> Make coverage report paths relative to dir (default: cwd)\n"
     "  --coverage-include <patterns> Only report files matching a comma separated prefix or glob\n"
     "  --coverage-exclude <patterns> Leave out files matching a comma separated prefix or glob\n"
+    "  --coverage-summary  Leave uncovered lines and functions out of coverage json reports\n"
     "  --fix-lint          Run the lint command of projects with the autofix action\n"
     "  --trace             Echo compiler and linker commands\n"
     "  -j <count>          Number of parallel jobs for build/test execution\n"

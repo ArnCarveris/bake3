@@ -58,6 +58,7 @@ int main(int argc, char *argv[]) {
         BFLAG("--standalone", standalone)
         BFLAG("--strict", strict)
         BFLAG("--coverage", coverage)
+        BFLAG("--coverage-summary", coverage_summary)
         BFLAG("--fix-lint", fix_lint)
         BFLAG("--trace", trace)
         BFLAG("--local", setup_local)
@@ -241,17 +242,20 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
 
-    if (opts.coverage_root || opts.coverage_include || opts.coverage_exclude) {
+    if (opts.coverage_root || opts.coverage_include || opts.coverage_exclude ||
+        opts.coverage_summary)
+    {
         const char *cmd = opts.command ? opts.command : "build";
         bool writes_report = !strcmp(cmd, "run") || !strcmp(cmd, "test");
         if (!writes_report && strcmp(cmd, "coverage-report")) {
-            ecs_err("--coverage-root, --coverage-include and --coverage-exclude "
-                "can only be used with the run, test and coverage-report commands");
+            ecs_err("--coverage-root, --coverage-include, --coverage-exclude and "
+                "--coverage-summary can only be used with the run, test and "
+                "coverage-report commands");
             goto cleanup;
         }
         if (writes_report && !opts.coverage) {
-            ecs_err("--coverage-root, --coverage-include and --coverage-exclude "
-                "require --coverage for the %s command", cmd);
+            ecs_err("--coverage-root, --coverage-include, --coverage-exclude and "
+                "--coverage-summary require --coverage for the %s command", cmd);
             goto cleanup;
         }
     }

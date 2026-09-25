@@ -127,6 +127,7 @@ Options:
   --coverage-root <dir> Make coverage report paths relative to dir (default: cwd)
   --coverage-include <patterns> Only report files matching a comma separated prefix or glob
   --coverage-exclude <patterns> Leave out files matching a comma separated prefix or glob
+  --coverage-summary  Leave uncovered lines and functions out of coverage json reports
   --fix-lint          Run the lint command of projects with the autofix action
   --trace             Enable trace logging (Flecs log level 0)
   -j <count>          Number of parallel jobs for build/test execution
@@ -686,8 +687,17 @@ bake3 run test/core --local-env --coverage -- -j 12 --json /tmp/core.json
 - `uncovered_lines` lists the lines that never ran as inclusive `[first, last]`
   ranges. A range spans lines without code (blank lines, comments), so it
   describes a block that did not run.
-- `uncovered_functions` lists the functions that were never called, with the
-  line they start on.
+- `uncovered_functions` lists the functions that were never called and whose
+  first line never ran, with the line they start on, sorted by line. A
+  function that is instantiated more than once (a template, or an inline
+  function in a header) is only listed when none of its instances ran, and
+  once per line. C++ names are demangled without their parameters and
+  template arguments (`tpl::box::twice` for `_ZNK3tpl3boxIiE5twiceEv`), using
+  the `llvm-cxxfilt` of the compiler (`<cc> -print-prog-name`), or
+  `llvm-cxxfilt` or `c++filt` from the `PATH` when that one is missing or does
+  not support `-p`. The html report of `coverage-report` shows the same names.
+- The `lines`, `functions` and `branches` counts are the ones `llvm-cov`
+  reports, whatever functions are listed.
 - Sources of the test project itself and generated harness sources are left
   out, so the report covers the code under test.
 - `files` is sorted by path.
@@ -717,9 +727,14 @@ bake3 run test/core --local-env --coverage --coverage-include src,include \
   --coverage-exclude 'src/addons/**' -- -j 12 --json /tmp/core.json
 ```
 
+`--coverage-summary` leaves `uncovered_lines` and `uncovered_functions` out of
+the report, so every file only has its counts. This keeps reports of large
+projects small when only the numbers are needed.
+
 The options are accepted by `run` and `test` together with `--coverage`, and by
 `coverage-report`, which applies them the same way to `coverage.json`, the
-summary and the html report.
+summary and the html report (`--coverage-summary` only changes
+`coverage.json`).
 
 Every case process writes its profile to `coverage/` in the build directory of
 the test project (`.bake/<arch-os-config>/coverage`, or

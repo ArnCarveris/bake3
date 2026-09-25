@@ -16,6 +16,7 @@ int bake_coverage_project_report(
     const char *exe,
     const char *json_path);
 bool bake_coverage_path_matches(const char *pattern, const char *path);
+char* bake_coverage_simplify_name(const char *name, bool strip_params);
 char* bake_coverage_dir(const bake_project_cfg_t *cfg, const char *mode);
 char* bake_coverage_profile_pattern(const char *coverage_dir);
 int bake_coverage_export_env(const bake_context_t *ctx, const bake_project_cfg_t *cfg);

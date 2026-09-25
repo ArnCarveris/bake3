@@ -2450,12 +2450,176 @@ class BakeTests(unittest.TestCase):
             ["build", "test/projects/c/app_helloworld", "--coverage",
              "--coverage-include", "src"]))
         self.assertIn(
-            "--coverage-root, --coverage-include and --coverage-exclude can only "
-            "be used with the run, test and coverage-report commands", output)
+            "--coverage-root, --coverage-include, --coverage-exclude and "
+            "--coverage-summary can only be used with the run, test and "
+            "coverage-report commands", output)
+
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["rebuild", "test/projects/c/app_helloworld", "--coverage-summary"]))
+        self.assertIn("can only be used with the run, test and", output)
 
         output = self.strip_ansi(self.bake_expect_failure(
             ["run", "test/projects/c/app_helloworld", "--coverage-root", "."]))
         self.assertIn("require --coverage for the run command", output)
+
+    def test_coverage_summary_leaves_out_uncovered_lists(self) -> None:
+        self.require_coverage_compiler()
+        root, test_id = self.write_coverage_workspace("coverage_summary")
+        local_env = "--local-env=coverage"
+        report = root / "report.json"
+        coverage = root / "report.coverage.json"
+
+        self.bake(
+            [local_env, "run", "test", "--coverage", "--", "--json", str(report)],
+            cwd=root)
+        full = json.loads(coverage.read_text())
+
+        output = self.bake(
+            [local_env, "run", "test", "--coverage", "--coverage-summary",
+             "--", "--json", str(report)],
+            cwd=root)
+        self.assertIn("coverage: 80.00% lines (12/15)", output)
+        data = json.loads(coverage.read_text())
+        self.assertEqual(data["project"], test_id)
+        self.assertEqual(
+            [f["file"] for f in data["files"]], [f["file"] for f in full["files"]])
+        for summary, detail in zip(data["files"], full["files"]):
+            self.assertEqual(
+                set(summary), {"file", "lines", "functions", "branches"})
+            for key in ("lines", "functions", "branches"):
+                self.assertEqual(summary[key], detail[key])
+        for key in ("lines", "functions", "branches"):
+            self.assertEqual(data[key], full[key])
+
+        self.bake(
+            [local_env, "coverage-report", "--coverage-summary"], cwd=root)
+        report_dir = root / ".bake" / "local_env" / "coverage" / "coverage_report"
+        combined = json.loads((report_dir / "coverage.json").read_text())
+        self.assertEqual(combined["projects"], [test_id])
+        for f in combined["files"]:
+            self.assertEqual(set(f), {"file", "lines", "functions", "branches"})
+        self.assertTrue((report_dir / "index.html").is_file())
+        self.assertTrue(list((report_dir / "files").glob("*.js")))
+
+    def test_coverage_uncovered_functions_are_demangled_and_deduplicated(self) -> None:
+        self.require_coverage_compiler()
+        cxx = shutil.which("c++")
+        version = subprocess.run(
+            [cxx, "--version"], text=True, capture_output=True, check=False
+        ) if cxx else None
+        if not version or "clang" not in (version.stdout or ""):
+            self.skipTest("coverage of C++ code requires clang++")
+
+        stamp = int(time.time() * 1_000_000)
+        lib_id = f"tmp_tests_cov_tpl_lib_{stamp}"
+        test_id = f"tmp.tests.cov_tpl.test.{stamp}"
+        root = self.repo_root / "test" / "tmp" / f"coverage_cpp_{stamp}"
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        (root / "lib" / "src").mkdir(parents=True)
+        (root / "lib" / "include").mkdir(parents=True)
+        (root / "test" / "src").mkdir(parents=True)
+        (root / "lib" / "project.json").write_text(json.dumps(
+            {"id": lib_id, "type": "package", "value": {"language": "c++"}}) + "\n")
+        (root / "lib" / "include" / f"{lib_id}.h").write_text(
+            "namespace tpl {\n"
+            "template <typename T>\n"
+            "struct box {\n"
+            "    T value;\n"
+            "    T get() const {\n"
+            "        return value;\n"
+            "    }\n"
+            "    T twice() const {\n"
+            "        return value * 2;\n"
+            "    }\n"
+            "};\n"
+            "int used(int x);\n"
+            "int unused(int x);\n"
+            "double maybe(bool call);\n"
+            "}\n"
+        )
+        (root / "lib" / "src" / "tpl.cpp").write_text(
+            f"#include <{lib_id}.h>\n"
+            "template struct tpl::box<int>;\n"
+            "template struct tpl::box<long>;\n"
+            "namespace tpl {\n"
+            "int used(int x) {\n"
+            "    box<int> b{x};\n"
+            "    return b.get();\n"
+            "}\n"
+            "int unused(int x) {\n"
+            "    return x + 1;\n"
+            "}\n"
+            "double maybe(bool call) {\n"
+            "    box<double> b{1.5};\n"
+            "    if (call) {\n"
+            "        return b.get();\n"
+            "    }\n"
+            "    return 0;\n"
+            "}\n"
+            "}\n"
+        )
+        (root / "test" / "project.json").write_text(json.dumps({
+            "id": test_id,
+            "type": "test",
+            "value": {"language": "c++", "use": [lib_id]},
+            "test": {"testsuites": [{"id": "Tpl", "testcases": ["used"]}]},
+        }) + "\n")
+        (root / "test" / "src" / "Tpl.cpp").write_text(
+            "#include <bake_test.h>\n"
+            f"#include <{lib_id}.h>\n"
+            "void Tpl_used(void) {\n"
+            "    test_int(tpl::used(3), 3);\n"
+            "    test_assert(tpl::maybe(false) == 0);\n"
+            "}\n"
+        )
+
+        local_env = "--local-env=coverage"
+        report = root / "report.json"
+        self.bake(
+            [local_env, "run", "test", "--coverage", "--coverage-root", "lib",
+             "--", "--json", str(report)],
+            cwd=root)
+        data = json.loads((root / "report.coverage.json").read_text())
+        files = {f["file"]: f for f in data["files"]}
+        header = files[f"include/{lib_id}.h"]
+        source = files["src/tpl.cpp"]
+
+        self.assertEqual(header["uncovered_lines"], [[8, 10]])
+        self.assertEqual(
+            header["uncovered_functions"], [{"name": "tpl::box::twice", "line": 8}])
+        self.assertEqual(
+            source["uncovered_functions"], [{"name": "tpl::unused", "line": 9}])
+        self.assertEqual(source["uncovered_lines"], [[9, 11], [15, 16]])
+
+        lcov = next(
+            (root / ".bake" / "local_env" / "coverage" / "build").glob(
+                "**/coverage/coverage.lcov")).read_text()
+        self.assertEqual(lcov.count("FN:8,"), 2)
+        self.assertEqual(lcov.count("FN:5,"), 4)
+        fnf = {}
+        current = None
+        for line in lcov.splitlines():
+            if line.startswith("SF:"):
+                current = Path(line[3:]).name
+            elif line.startswith("FNF:"):
+                fnf[current] = int(line[4:])
+        self.assertEqual(header["functions"]["count"], fnf[f"{lib_id}.h"])
+        self.assertEqual(source["functions"]["count"], fnf["tpl.cpp"])
+
+        self.bake([local_env, "coverage-report", "--coverage-root", "lib"], cwd=root)
+        report_dir = root / ".bake" / "local_env" / "coverage" / "coverage_report"
+        combined = json.loads((report_dir / "coverage.json").read_text())
+        merged = {f["file"]: f for f in combined["files"]}
+        self.assertEqual(
+            merged[f"include/{lib_id}.h"]["uncovered_functions"],
+            [{"name": "tpl::box::twice", "line": 8}])
+        self.assertEqual(
+            merged["src/tpl.cpp"]["uncovered_functions"],
+            [{"name": "tpl::unused", "line": 9}])
+        self.assertEqual(merged["src/tpl.cpp"]["functions"], source["functions"])
+        pages = "".join(p.read_text() for p in (report_dir / "files").glob("*.js"))
+        self.assertIn('"tpl::box::twice",8,0', pages)
+        self.assertNotIn("_ZN", pages)
 
     def test_coverage_requires_clang(self) -> None:
         if platform.system() == "Windows":
