@@ -976,6 +976,78 @@ class BakeTests(unittest.TestCase):
             "Expected build to update artefact after touching project.json",
         )
 
+    def test_header_change_rebuilds_dependent_sources(self) -> None:
+        """Editing a header recompiles every source that includes it.
+
+        direct.c includes the header, indirect.c includes it through another
+        header, and unrelated.c does not include it and must stay untouched.
+        """
+        stamp = int(time.time() * 1_000_000)
+        root = self.repo_root / "test" / "tmp" / f"header_deps_{stamp}"
+        (root / "src").mkdir(parents=True)
+        (root / "include").mkdir(parents=True)
+        (root / "project.json").write_text(
+            "{\n"
+            f'    "id": "header_deps_{stamp}",\n'
+            '    "type": "application"\n'
+            "}\n"
+        )
+        header = root / "include" / "shared.h"
+        header.write_text("#define SHARED_VALUE 1\n")
+        (root / "include" / "wrapper.h").write_text('#include "shared.h"\n')
+        (root / "src" / "direct.c").write_text(
+            '#include "shared.h"\n'
+            "int direct_value(void) { return SHARED_VALUE; }\n"
+        )
+        (root / "src" / "indirect.c").write_text(
+            '#include "wrapper.h"\n'
+            "int indirect_value(void) { return SHARED_VALUE * 10; }\n"
+        )
+        (root / "src" / "unrelated.c").write_text(
+            "int unrelated_value(void) { return 100; }\n"
+        )
+        (root / "src" / "main.c").write_text(
+            "#include <stdio.h>\n"
+            "int direct_value(void);\n"
+            "int indirect_value(void);\n"
+            "int unrelated_value(void);\n"
+            "int main(void) {\n"
+            '    printf("values=%d,%d,%d\\n",\n'
+            "        direct_value(), indirect_value(), unrelated_value());\n"
+            "    return 0;\n"
+            "}\n"
+        )
+
+        output = self.strip_ansi(self.bake(["run", str(root)], cwd=self.repo_root))
+        self.assertIn("values=1,10,100", output)
+
+        obj_dirs = sorted(root.glob(".bake/*/obj"))
+        self.assertEqual(len(obj_dirs), 1, f"Expected one object directory under {root / '.bake'}")
+        obj_dir = obj_dirs[0] / "src"
+
+        def obj_mtimes() -> dict[str, int]:
+            return {
+                name: (obj_dir / f"{name}.c{OBJ_SUFFIX}").stat().st_mtime_ns
+                for name in ("direct", "indirect", "unrelated", "main")
+            }
+
+        before = obj_mtimes()
+        time.sleep(0.05)
+        header.write_text("#define SHARED_VALUE 2\n")
+
+        output = self.strip_ansi(self.bake(["run", str(root)], cwd=self.repo_root))
+        self.assertIn("values=2,20,100", output)
+
+        after = obj_mtimes()
+        self.assertGreater(after["direct"], before["direct"],
+            "Expected source that includes the header directly to be rebuilt")
+        self.assertGreater(after["indirect"], before["indirect"],
+            "Expected source that includes the header indirectly to be rebuilt")
+        self.assertEqual(after["unrelated"], before["unrelated"],
+            "Expected source that does not include the header to be left alone")
+        self.assertEqual(after["main"], before["main"],
+            "Expected source that does not include the header to be left alone")
+
     def test_build_app_with_json_comments(self) -> None:
         target = "test/projects/c/app_w_comments"
         self.bake(["build", target])

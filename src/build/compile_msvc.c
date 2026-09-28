@@ -78,6 +78,17 @@ int bake_compose_compile_command_msvc(const bake_compile_cmd_ctx_t *ctx, ecs_str
         ecs_strbuf_append(cmd, " /I\"%s\"", ctx->dep_includes->items[i]);
     }
 
+    /* Record every header the unit includes, directly or indirectly, so a
+     * header change recompiles it. clang-cl has no /sourceDependencies but
+     * passes gcc style depfile options through /clang:. */
+    if (ctx->unit->dep) {
+        if (strstr(compiler, "clang-cl")) {
+            ecs_strbuf_append(cmd, " /clang:-MMD \"/clang:-MF%s\"", ctx->unit->dep);
+        } else {
+            ecs_strbuf_append(cmd, " /sourceDependencies \"%s\"", ctx->unit->dep);
+        }
+    }
+
     ecs_strbuf_append(cmd, " /Fo\"%s\" \"%s\"", ctx->unit->obj, ctx->unit->src);
     return 0;
 }

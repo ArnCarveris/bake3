@@ -173,10 +173,9 @@ static int bake_collect_visit(const bake_dir_entry_t *entry, void *ctx_ptr) {
     }
     ecs_os_free(obj_parent);
 
-    char *dep_path = NULL;
-    if (ctx->compiler_kind != BAKE_COMPILER_MSVC) {
-        dep_path = flecs_asprintf("%s.d", obj_path);
-    }
+    /* gcc/clang write a make depfile here, MSVC a /sourceDependencies JSON
+     * file. bake_depfile_outdated tells the two formats apart. */
+    char *dep_path = flecs_asprintf("%s.d", obj_path);
 
     int rc = bake_compile_list_append(ctx->units, entry->path, obj_path, dep_path, cpp);
     if (rc == 0) {

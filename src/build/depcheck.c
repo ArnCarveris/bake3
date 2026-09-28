@@ -1,6 +1,7 @@
 #include "build_internal.h"
 #include "depcheck_internal.h"
 #include "bake/os.h"
+#include "parson.h"
 
 static bool bake_dep_token_outdated(const char *token, int64_t obj_mtime) {
     if (!token[0]) {
@@ -28,11 +29,49 @@ static char* bake_dep_token_reserve(char *token, size_t token_len, size_t *token
     return ecs_os_realloc_n(token, char, next_cap);
 }
 
+/* MSVC /sourceDependencies output: {"Data": {"Includes": ["c:\...h", ...]}}.
+ * Includes lists every header the unit pulled in, directly or indirectly. */
+static bool bake_source_dependencies_outdated(const char *content, int64_t obj_mtime) {
+    JSON_Value *root = json_parse_string(content);
+    if (!root) {
+        return true;
+    }
+
+    JSON_Array *includes = json_object_dotget_array(
+        json_value_get_object(root), "Data.Includes");
+    if (!includes) {
+        json_value_free(root);
+        return true;
+    }
+
+    bool outdated = false;
+    size_t count = json_array_get_count(includes);
+    for (size_t i = 0; i < count && !outdated; i++) {
+        const char *path = json_array_get_string(includes, i);
+        if (!path || bake_dep_token_outdated(path, obj_mtime)) {
+            outdated = true;
+        }
+    }
+
+    json_value_free(root);
+    return outdated;
+}
+
 bool bake_depfile_outdated(const char *dep_path, int64_t obj_mtime) {
     size_t len = 0;
     char *content = bake_file_read(dep_path, &len);
     if (!content) {
         return true;
+    }
+
+    size_t first = 0;
+    while (first < len && bake_char_is_space(content[first])) {
+        first++;
+    }
+    if (first < len && content[first] == '{') {
+        bool outdated = bake_source_dependencies_outdated(content, obj_mtime);
+        ecs_os_free(content);
+        return outdated;
     }
 
     bool seen_colon = false;
