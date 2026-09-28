@@ -465,8 +465,8 @@ int bake_generate_config_header(ecs_world_t *world, const bake_project_cfg_t *cf
         ecs_strbuf_append(&header, "  #define %s __declspec(dllexport)\n", api_macro);
         ecs_strbuf_append(&header, "#elif defined(%s_EXPORTS)\n", project_macro);
         ecs_strbuf_append(&header, "  #define %s __attribute__((__visibility__(\"default\")))\n", api_macro);
-        ecs_strbuf_appendstr(&header, "#elif defined(_MSC_VER)\n");
-        ecs_strbuf_append(&header, "  #define %s __declspec(dllimport)\n", api_macro);
+        /* No dllimport branch: with MSVC bake links packages as static
+         * libraries, so dependees must reference their symbols directly. */
         ecs_strbuf_appendstr(&header, "#else\n");
         ecs_strbuf_append(&header, "  #define %s\n", api_macro);
         ecs_strbuf_appendstr(&header, "#endif\n");

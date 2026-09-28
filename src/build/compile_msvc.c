@@ -1,15 +1,55 @@
 #include "build_internal.h"
 #include "compile_internal.h"
 #include "bake/os.h"
+#include <ctype.h>
+#include <stdlib.h>
+
+/* Map a gcc style language standard (c11, gnu99, c++17, ...) to the value of
+ * MSVC's /std flag. MSVC has no C99 or C++11 mode; those map to the oldest
+ * mode that includes them. Returns NULL to keep the compiler default. */
+static const char* bake_msvc_std_flag(const char *std, bool cpp) {
+    if (!std || !std[0]) {
+        return NULL;
+    }
+
+    const char *digits = std;
+    while (*digits && !isdigit((unsigned char)*digits)) {
+        digits++;
+    }
+    if (!digits[0]) {
+        return NULL;
+    }
+    int version = atoi(digits);
+
+    if (cpp) {
+        if (version == 98 || version == 3 || version == 11 || version == 14) return "c++14";
+        if (version == 17) return "c++17";
+        if (version == 20) return "c++20";
+        return "c++latest";
+    }
+
+    if (version == 89 || version == 90 || version == 99 || version == 11) return "c11";
+    if (version == 17 || version == 18) return "c17";
+    return "clatest";
+}
 
 int bake_compose_compile_command_msvc(const bake_compile_cmd_ctx_t *ctx, ecs_strbuf_t *cmd) {
     const char *compiler = ctx->unit->cpp
         ? (ctx->ctx->opts.cxx ? ctx->ctx->opts.cxx : "cl")
         : (ctx->ctx->opts.cc ? ctx->ctx->opts.cc : "cl");
 
-    ecs_strbuf_append(cmd, "%s /nologo /c", compiler);
+    /* Link the release DLL runtime in every mode: Rust staticlibs always use
+     * it, and bundles are configured to match (see bake_bundle_run_cmake). */
+    ecs_strbuf_append(cmd, "%s /nologo /c /MD", compiler);
     for (int32_t i = 0; i < ctx->mode_flags->count; i++) {
         ecs_strbuf_append(cmd, " %s", ctx->mode_flags->items[i]);
+    }
+
+    const char *std = bake_msvc_std_flag(ctx->unit->cpp
+        ? ctx->lang->cpp_standard
+        : ctx->lang->c_standard, ctx->unit->cpp);
+    if (std) {
+        ecs_strbuf_append(cmd, " /std:%s", std);
     }
     bake_list_append_fmt(cmd, &ctx->lang->cflags, "");
     if (ctx->unit->cpp) {
@@ -42,6 +82,19 @@ int bake_compose_compile_command_msvc(const bake_compile_cmd_ctx_t *ctx, ecs_str
     return 0;
 }
 
+/* GNU toolchain runtime libraries that the MSVC runtime already provides. */
+static bool bake_msvc_lib_is_implicit(const char *lib) {
+    static const char *implicit[] = {
+        "m", "c", "c++", "stdc++", "pthread", "dl", "rt", NULL
+    };
+    for (int32_t i = 0; implicit[i]; i++) {
+        if (!strcmp(lib, implicit[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int bake_compose_link_command_msvc(const bake_link_cmd_ctx_t *ctx, ecs_strbuf_t *cmd) {
     bool is_lib = ctx->cfg->kind == BAKE_PROJECT_PACKAGE;
     if (is_lib) {
@@ -64,10 +117,14 @@ int bake_compose_link_command_msvc(const bake_link_cmd_ctx_t *ctx, ecs_strbuf_t 
         ecs_strbuf_append(cmd, " \"%s\"", ctx->dep_artefacts->items[i]);
     }
     for (int32_t i = 0; i < ctx->lang->libs.count; i++) {
-        ecs_strbuf_append(cmd, " %s.lib", ctx->lang->libs.items[i]);
+        if (!bake_msvc_lib_is_implicit(ctx->lang->libs.items[i])) {
+            ecs_strbuf_append(cmd, " %s.lib", ctx->lang->libs.items[i]);
+        }
     }
     for (int32_t i = 0; i < ctx->dep_libs->count; i++) {
-        ecs_strbuf_append(cmd, " %s.lib", ctx->dep_libs->items[i]);
+        if (!bake_msvc_lib_is_implicit(ctx->dep_libs->items[i])) {
+            ecs_strbuf_append(cmd, " %s.lib", ctx->dep_libs->items[i]);
+        }
     }
     ecs_strbuf_append(cmd, " /Fe\"%s\"", ctx->artefact);
     ecs_strbuf_appendstr(cmd, " /link");

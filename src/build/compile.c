@@ -60,7 +60,8 @@ bake_compiler_kind_t bake_detect_compiler_kind(const char *cc, const char *cxx) 
 }
 
 void bake_add_mode_flags(const char *mode, bake_compiler_kind_t kind, bake_strlist_t *cflags, bake_strlist_t *cxxflags, bake_strlist_t *ldflags) {
-    static const char *msvc_debug[] = {"/Zi", "/Od", NULL};
+    static const char *msvc_debug[] = {"/Z7", "/Od", NULL};
+    static const char *msvc_debug_ld[] = {"/DEBUG", NULL};
     static const char *msvc_release[] = {"/O2", "/GL", NULL};
     static const char *msvc_release_ld[] = {"/LTCG", NULL};
     static const char *msvc_profile[] = {"/O2", NULL};

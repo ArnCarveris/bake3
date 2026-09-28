@@ -550,6 +550,14 @@ static int bake_bundle_run_cmake(
     ecs_strbuf_append(&configure,
         "%s -S %s -B %s -DCMAKE_INSTALL_PREFIX=%s -DCMAKE_BUILD_TYPE=%s -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON",
         cmake_launcher, quoted_src, quoted_build, quoted_install, build_type);
+#if defined(_WIN32)
+    /* Match the /MD runtime bake uses for MSVC projects; ignored by MinGW. */
+    if (!bake_target_is_emscripten()) {
+        ecs_strbuf_appendstr(&configure,
+            " -DCMAKE_POLICY_DEFAULT_CMP0091=NEW"
+            " -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL");
+    }
+#endif
     for (int32_t i = 0; i < bundle->cmake_args.count; i++) {
         char *q = bake_shell_quote_arg(bundle->cmake_args.items[i]);
         ecs_strbuf_append(&configure, " %s", q);

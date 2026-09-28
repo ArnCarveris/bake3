@@ -157,11 +157,11 @@ int bake_proc_run(
         return -1;
     }
 
-    STARTUPINFOA si;
+    STARTUPINFOEXA six;
     PROCESS_INFORMATION pi;
-    memset(&si, 0, sizeof(si));
+    memset(&six, 0, sizeof(six));
     memset(&pi, 0, sizeof(pi));
-    si.cb = sizeof(si);
+    six.StartupInfo.cb = sizeof(six.StartupInfo);
 
     HANDLE std_in = NULL;
     HANDLE std_out = NULL;
@@ -218,10 +218,10 @@ int bake_proc_run(
 
         /* Absent std handles (no console) are passed through as NULL;
          * only an explicitly requested redirect may fail the spawn. */
-        si.dwFlags |= STARTF_USESTDHANDLES;
-        si.hStdInput = std_in;
-        si.hStdOutput = std_out;
-        si.hStdError = std_err;
+        six.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+        six.StartupInfo.hStdInput = std_in;
+        six.StartupInfo.hStdOutput = std_out;
+        six.StartupInfo.hStdError = std_err;
         inherit_handles = TRUE;
     }
 
@@ -230,18 +230,58 @@ int bake_proc_run(
         cwd = stdio_cfg->cwd;
     }
 
+    /* Only let the child inherit its own std handles. Without a handle list
+     * a process spawned concurrently from another thread inherits every
+     * inheritable handle of this one, keeping redirect files open (and not
+     * removable) after this child exits. */
+    HANDLE inherit_list[3];
+    DWORD inherit_count = 0;
+    HANDLE std_handles[3] = { std_in, std_out, std_err };
+    for (int i = 0; i < 3; i++) {
+        HANDLE h = std_handles[i];
+        bool dup = !h;
+        for (DWORD j = 0; j < inherit_count && !dup; j++) {
+            dup = inherit_list[j] == h;
+        }
+        if (!dup) {
+            inherit_list[inherit_count++] = h;
+        }
+    }
+
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = NULL;
+    DWORD create_flags = 0;
+    if (inherit_handles && inherit_count) {
+        SIZE_T attr_size = 0;
+        InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+        attrs = ecs_os_malloc((ecs_size_t)attr_size);
+        if (attrs && InitializeProcThreadAttributeList(attrs, 1, 0, &attr_size) &&
+            UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                inherit_list, inherit_count * sizeof(HANDLE), NULL, NULL))
+        {
+            six.lpAttributeList = attrs;
+            six.StartupInfo.cb = sizeof(six);
+            create_flags |= EXTENDED_STARTUPINFO_PRESENT;
+        }
+    }
+
     BOOL ok = CreateProcessA(
         NULL,
         cmd_line,
         NULL,
         NULL,
         inherit_handles,
-        0,
+        create_flags,
         NULL,
         cwd,
-        &si,
+        &six.StartupInfo,
         &pi);
     ecs_os_free(cmd_line);
+    if (attrs) {
+        if (six.lpAttributeList) {
+            DeleteProcThreadAttributeList(attrs);
+        }
+        ecs_os_free(attrs);
+    }
 
     if (std_in) CloseHandle(std_in);
     if (std_out) CloseHandle(std_out);
