@@ -2317,7 +2317,12 @@ class BakeTests(unittest.TestCase):
         )
 
         self.assertEqual(serial_summaries, expected_summaries)
-        self.assertEqual(parallel_summaries, serial_summaries)
+        self.assertEqual(
+            sorted(parallel_summaries.splitlines()),
+            sorted(serial_summaries.splitlines()),
+        )
+        self.assertTrue(
+            parallel_summaries.splitlines()[-1].endswith(f"({project_id}.all)"))
         expected_cases = [
             f"CASE {suite}.{case}"
             for suite in ("Alpha", "Beta")
@@ -2330,7 +2335,7 @@ class BakeTests(unittest.TestCase):
             line for line in parallel_output.splitlines() if line.startswith("CASE ")
         ]
         self.assertEqual(serial_cases, expected_cases)
-        self.assertEqual(parallel_cases, serial_cases)
+        self.assertEqual(sorted(parallel_cases), sorted(serial_cases))
         self.assertGreater(serial_elapsed, 10.0)
         self.assertLess(
             parallel_elapsed,

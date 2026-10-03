@@ -1172,6 +1172,7 @@ typedef struct bake_suite_run_t {
     char param_str[512];
     size_t first_job;
     size_t job_count;
+    size_t done_count;
 } bake_suite_run_t;
 
 typedef struct bake_case_plan_t {
@@ -1185,16 +1186,21 @@ typedef struct bake_case_plan_t {
 
 #if defined(_WIN32)
 typedef CRITICAL_SECTION bake_jobs_mutex_t;
+typedef CONDITION_VARIABLE bake_jobs_cond_t;
 typedef HANDLE bake_worker_thread_t;
 #else
 typedef pthread_mutex_t bake_jobs_mutex_t;
+typedef pthread_cond_t bake_jobs_cond_t;
 typedef pthread_t bake_worker_thread_t;
 #endif
 
 typedef struct bake_case_jobs_t {
     bake_case_plan_t *plan;
     size_t next_job;
+    size_t *ready;
+    size_t ready_count;
     bake_jobs_mutex_t lock;
+    bake_jobs_cond_t done;
 } bake_case_jobs_t;
 
 static void bake_jobs_mutex_init(bake_jobs_mutex_t *mutex) {
@@ -1226,6 +1232,38 @@ static void bake_jobs_mutex_fini(bake_jobs_mutex_t *mutex) {
     DeleteCriticalSection(mutex);
 #else
     pthread_mutex_destroy(mutex);
+#endif
+}
+
+static void bake_jobs_cond_init(bake_jobs_cond_t *cond) {
+#if defined(_WIN32)
+    InitializeConditionVariable(cond);
+#else
+    pthread_cond_init(cond, NULL);
+#endif
+}
+
+static void bake_jobs_cond_wait(bake_jobs_cond_t *cond, bake_jobs_mutex_t *mutex) {
+#if defined(_WIN32)
+    SleepConditionVariableCS(cond, mutex, INFINITE);
+#else
+    pthread_cond_wait(cond, mutex);
+#endif
+}
+
+static void bake_jobs_cond_broadcast(bake_jobs_cond_t *cond) {
+#if defined(_WIN32)
+    WakeAllConditionVariable(cond);
+#else
+    pthread_cond_broadcast(cond);
+#endif
+}
+
+static void bake_jobs_cond_fini(bake_jobs_cond_t *cond) {
+#if defined(_WIN32)
+    (void)cond;
+#else
+    pthread_cond_destroy(cond);
 #endif
 }
 
@@ -1444,6 +1482,15 @@ static void bake_case_worker_run(bake_case_jobs_t *jobs) {
         if (job->command_rc == 0) {
             bake_case_job_execute(job);
         }
+
+        bake_jobs_mutex_lock(&jobs->lock);
+        bake_suite_run_t *run = &jobs->plan->runs[job->run_index];
+        run->done_count ++;
+        if (run->done_count == run->job_count) {
+            jobs->ready[jobs->ready_count ++] = job->run_index;
+            bake_jobs_cond_broadcast(&jobs->done);
+        }
+        bake_jobs_mutex_unlock(&jobs->lock);
     }
 }
 
@@ -1487,8 +1534,9 @@ static void bake_parallel_apply_params(bake_suite_run_t *run) {
     }
 }
 
-static int bake_parallel_report(
+static int bake_parallel_report_run(
     bake_case_plan_t *plan,
+    bake_suite_run_t *run,
     const char *test_id,
     const char *exec,
     int *pass_out,
@@ -1496,77 +1544,74 @@ static int bake_parallel_report(
     int *empty_out)
 {
     int rc = 0;
+    bake_test_suite *suite = run->suite;
+    int pass = 0;
+    int fail = 0;
+    int empty = 0;
+    bake_parallel_apply_params(run);
 
-    for (size_t r = 0; r < plan->run_count; r++) {
-        bake_suite_run_t *run = &plan->runs[r];
-        bake_test_suite *suite = run->suite;
-        int pass = 0;
-        int fail = 0;
-        int empty = 0;
-        bake_parallel_apply_params(run);
-
-        for (size_t j = 0; j < run->job_count; j++) {
-            bake_case_job_t *job = &plan->jobs[run->first_job + j];
-            if (g_trace) {
-                bake_print_trace(suite->id, job->testcase->id, run->param_str);
-            }
-            if (job->output_size) {
-                fwrite(job->output, 1, job->output_size, stdout);
-            }
-            if (job->command_rc != 0) {
-                fail ++;
-                rc = -1;
-                bake_record_result(suite->id, job->testcase->id, run->param_str, "error", job->elapsed);
-                bake_record_failure(suite->id, job->testcase->id, run->param_str, NULL);
-                continue;
-            }
-
-            if (job->timed_out) {
-                fail ++;
-                rc = -1;
-                g_timeout_count ++;
-                bake_record_result(suite->id, job->testcase->id, run->param_str, "timeout", job->elapsed);
-                bake_record_failure(suite->id, job->testcase->id, run->param_str, "timeout");
-                bake_print_status("TIMEOUT", BAKE_COLOR_RED);
-                printf(" %s.%s (exceeded %g seconds)\n",
-                    suite->id, job->testcase->id, job->timeout);
-                bake_print_debug_command(exec, suite, job->testcase);
-                continue;
-            }
-
-            if (job->test_rc == 0) {
-                pass ++;
-                bake_record_result(suite->id, job->testcase->id, run->param_str, "pass", job->elapsed);
-                continue;
-            }
-            if (job->test_rc == BAKE_TEST_QUARANTINED) {
-                bake_record_result(suite->id, job->testcase->id, run->param_str, "quarantined", job->elapsed);
-                continue;
-            }
-            if (job->test_rc == BAKE_TEST_EMPTY) {
-                empty ++;
-                bake_record_result(suite->id, job->testcase->id, run->param_str, "empty", job->elapsed);
-                bake_print_status("EMPTY", BAKE_COLOR_YELLOW);
-                printf(" %s.%s (add test statements)\n", suite->id, job->testcase->id);
-                bake_print_debug_command(exec, suite, job->testcase);
-                continue;
-            }
-
+    for (size_t j = 0; j < run->job_count; j++) {
+        bake_case_job_t *job = &plan->jobs[run->first_job + j];
+        if (g_trace) {
+            bake_print_trace(suite->id, job->testcase->id, run->param_str);
+        }
+        if (job->output_size) {
+            fwrite(job->output, 1, job->output_size, stdout);
+        }
+        if (job->command_rc != 0) {
             fail ++;
             rc = -1;
-            bake_record_result(suite->id, job->testcase->id, run->param_str, "fail", job->elapsed);
+            bake_record_result(suite->id, job->testcase->id, run->param_str, "error", job->elapsed);
             bake_record_failure(suite->id, job->testcase->id, run->param_str, NULL);
-            bake_print_debug_command(exec, suite, job->testcase);
+            continue;
         }
 
-        bake_print_report(test_id, suite->id, run->param_str, pass, fail, empty);
-        if (fail || empty) {
-            printf("\n");
+        if (job->timed_out) {
+            fail ++;
+            rc = -1;
+            g_timeout_count ++;
+            bake_record_result(suite->id, job->testcase->id, run->param_str, "timeout", job->elapsed);
+            bake_record_failure(suite->id, job->testcase->id, run->param_str, "timeout");
+            bake_print_status("TIMEOUT", BAKE_COLOR_RED);
+            printf(" %s.%s (exceeded %g seconds)\n",
+                suite->id, job->testcase->id, job->timeout);
+            bake_print_debug_command(exec, suite, job->testcase);
+            continue;
         }
-        *pass_out += pass;
-        *fail_out += fail;
-        *empty_out += empty;
+
+        if (job->test_rc == 0) {
+            pass ++;
+            bake_record_result(suite->id, job->testcase->id, run->param_str, "pass", job->elapsed);
+            continue;
+        }
+        if (job->test_rc == BAKE_TEST_QUARANTINED) {
+            bake_record_result(suite->id, job->testcase->id, run->param_str, "quarantined", job->elapsed);
+            continue;
+        }
+        if (job->test_rc == BAKE_TEST_EMPTY) {
+            empty ++;
+            bake_record_result(suite->id, job->testcase->id, run->param_str, "empty", job->elapsed);
+            bake_print_status("EMPTY", BAKE_COLOR_YELLOW);
+            printf(" %s.%s (add test statements)\n", suite->id, job->testcase->id);
+            bake_print_debug_command(exec, suite, job->testcase);
+            continue;
+        }
+
+        fail ++;
+        rc = -1;
+        bake_record_result(suite->id, job->testcase->id, run->param_str, "fail", job->elapsed);
+        bake_record_failure(suite->id, job->testcase->id, run->param_str, NULL);
+        bake_print_debug_command(exec, suite, job->testcase);
     }
+
+    bake_print_report(test_id, suite->id, run->param_str, pass, fail, empty);
+    if (fail || empty) {
+        printf("\n");
+    }
+    fflush(stdout);
+    *pass_out += pass;
+    *fail_out += fail;
+    *empty_out += empty;
 
     return rc;
 }
@@ -1599,13 +1644,27 @@ static int bake_run_cases_parallel(
 
     bake_case_jobs_t jobs = {
         .plan = &plan,
-        .next_job = 0
+        .next_job = 0,
+        .ready = calloc(plan.run_count, sizeof(size_t)),
+        .ready_count = 0
     };
+    if (!jobs.ready) {
+        bake_parallel_plan_fini(&plan);
+        return 1;
+    }
+    for (size_t r = 0; r < plan.run_count; r++) {
+        if (!plan.runs[r].job_count) {
+            jobs.ready[jobs.ready_count ++] = r;
+        }
+    }
     bake_jobs_mutex_init(&jobs.lock);
+    bake_jobs_cond_init(&jobs.done);
 
     bake_worker_thread_t *threads = calloc(
         (size_t)jobs_count, sizeof(bake_worker_thread_t));
     if (!threads) {
+        free(jobs.ready);
+        bake_jobs_cond_fini(&jobs.done);
         bake_jobs_mutex_fini(&jobs.lock);
         bake_parallel_plan_fini(&plan);
         return 1;
@@ -1620,9 +1679,27 @@ static int bake_run_cases_parallel(
     }
     if (!started) {
         free(threads);
+        free(jobs.ready);
+        bake_jobs_cond_fini(&jobs.done);
         bake_jobs_mutex_fini(&jobs.lock);
         bake_parallel_plan_fini(&plan);
         return 1;
+    }
+
+    int rc = 0;
+    for (size_t r = 0; r < plan.run_count; r++) {
+        bake_jobs_mutex_lock(&jobs.lock);
+        while (jobs.ready_count <= r) {
+            bake_jobs_cond_wait(&jobs.done, &jobs.lock);
+        }
+        bake_suite_run_t *run = &plan.runs[jobs.ready[r]];
+        bake_jobs_mutex_unlock(&jobs.lock);
+
+        if (bake_parallel_report_run(
+            &plan, run, test_id, exec, pass, fail, empty) != 0)
+        {
+            rc = -1;
+        }
     }
 
     int join_rc = 0;
@@ -1633,10 +1710,9 @@ static int bake_run_cases_parallel(
     }
 
     free(threads);
+    free(jobs.ready);
+    bake_jobs_cond_fini(&jobs.done);
     bake_jobs_mutex_fini(&jobs.lock);
-
-    int rc = bake_parallel_report(
-        &plan, test_id, exec, pass, fail, empty);
     bake_parallel_plan_fini(&plan);
     if (join_rc != 0) {
         return -1;
