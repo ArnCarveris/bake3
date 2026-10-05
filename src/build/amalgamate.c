@@ -843,14 +843,18 @@ static char* bake_clean_amalgamation(const char *in, size_t in_len) {
             continue;
         }
 
-        if (c == '\n') {
+        if (c == '\n' || (c == '\r' && p[1] == '\n')) {
+            /* A CRLF line ending (sources checked out on Windows) counts as
+             * one newline, so its blank lines collapse too. */
+            size_t len = c == '\r' ? 2 : 1;
             if (newline_run >= 2) {
-                p++;
+                p += len;
                 continue;
             }
-            out[w++] = '\n';
+            for (size_t i = 0; i < len; i++) {
+                out[w++] = *p++;
+            }
             newline_run++;
-            p++;
             continue;
         }
 

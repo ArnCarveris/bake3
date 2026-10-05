@@ -191,9 +191,11 @@ static void test_bundle_cargo_native_paths(void) {
 
     char *command = bake_bundle_cargo_command(
         NULL, "source dir", "build dir", "debug");
-    char *manifest = bake_path_join("source dir", "Cargo.toml");
+    char *manifest_path = bake_path_join("source dir", "Cargo.toml");
+    char *manifest = bake_shell_quote_arg(manifest_path);
+    ecs_os_free(manifest_path);
     char *expected = flecs_asprintf(
-        "cargo build --release --manifest-path \"%s\" --target-dir \"build dir\"",
+        "cargo build --release --manifest-path %s --target-dir \"build dir\"",
         manifest);
     CHECK_STR(command, expected);
     ecs_os_free(expected);
@@ -213,11 +215,13 @@ static void test_bundle_cargo_emscripten_paths(void) {
 
     char *command = bake_bundle_cargo_command(
         NULL, "source dir", "build dir", "profile");
-    char *manifest = bake_path_join("source dir", "Cargo.toml");
+    char *manifest_path = bake_path_join("source dir", "Cargo.toml");
+    char *manifest = bake_shell_quote_arg(manifest_path);
+    ecs_os_free(manifest_path);
     char *expected_command = flecs_asprintf(
         "cargo rustc --release --target wasm32-unknown-emscripten "
         "--crate-type staticlib "
-        "--manifest-path \"%s\" --target-dir \"build dir\"",
+        "--manifest-path %s --target-dir \"build dir\"",
         manifest);
     CHECK_STR(command, expected_command);
     ecs_os_free(expected_command);
@@ -244,9 +248,11 @@ static void test_bundle_cargo_args(void) {
 
     char *command = bake_bundle_cargo_command(
         &bundle, "source dir", "build dir", "debug");
-    char *manifest = bake_path_join("source dir", "Cargo.toml");
+    char *manifest_path = bake_path_join("source dir", "Cargo.toml");
+    char *manifest = bake_shell_quote_arg(manifest_path);
+    ecs_os_free(manifest_path);
     char *expected = flecs_asprintf(
-        "cargo build --release --manifest-path \"%s\" --target-dir \"build dir\" "
+        "cargo build --release --manifest-path %s --target-dir \"build dir\" "
         "\"--no-default-features\" \"--features=raster-images\"",
         manifest);
     CHECK_STR(command, expected);
@@ -486,13 +492,19 @@ static void test_ps_elapsed_formatting(void) {
     CHECK(bake_ps_parse_etime(NULL) == 0);
 }
 
+#if defined(_WIN32)
+#define TEST_SEP "\\"
+#else
+#define TEST_SEP "/"
+#endif
+
 static void test_ps_parse_local_env_path(void) {
     bake_ps_path_info_t info;
 
     CHECK(bake_ps_parse_local_env_path(
         "/ws/.bake/local_env/agent_a/arm64-Darwin/debug/bin/night_shift", &info) == 0);
     CHECK_STR(info.env, "agent_a");
-    CHECK_STR(info.workspace, "/ws");
+    CHECK_STR(info.workspace, TEST_SEP "ws");
     CHECK_STR(info.cfg, "debug");
     CHECK_STR(info.project, "night_shift");
     bake_ps_path_info_fini(&info);
@@ -500,7 +512,7 @@ static void test_ps_parse_local_env_path(void) {
     CHECK(bake_ps_parse_local_env_path(
         "/ws/.bake/local_env/arm64-Darwin/release/bin/night_shift", &info) == 0);
     CHECK(info.env == NULL);
-    CHECK_STR(info.workspace, "/ws");
+    CHECK_STR(info.workspace, TEST_SEP "ws");
     CHECK_STR(info.cfg, "release");
     CHECK_STR(info.project, "night_shift");
     bake_ps_path_info_fini(&info);
@@ -620,7 +632,7 @@ static void test_ps_render_columns(void) {
     if (home) {
         char *path = bake_path_join(home, "ws");
         rendered = bake_ps_render_workspace(path, false);
-        CHECK_STR(rendered, "~/ws");
+        CHECK_STR(rendered, "~" TEST_SEP "ws");
         ecs_os_free(rendered);
 
         rendered = bake_ps_render_workspace(path, true);
@@ -741,7 +753,7 @@ static void test_ps_shorten_path(void) {
     if (home) {
         char *path = bake_path_join(home, "ws");
         shortened = bake_ps_shorten_path(path, 64);
-        CHECK_STR(shortened, "~/ws");
+        CHECK_STR(shortened, "~" TEST_SEP "ws");
         ecs_os_free(shortened);
         ecs_os_free(path);
         ecs_os_free(home);

@@ -28,6 +28,64 @@ SUMMARY_RE = re.compile(
 )
 LIST_ENTRY_RE = re.compile(r"^(?P<kind>[APT])\s+(?P<name>.+?)\s+=>")
 
+# Declares the function after it as exported from a DLL. MSVC exports only
+# what is marked; gcc and clang (mingw included) export every symbol.
+DLL_EXPORT = "#if defined(_MSC_VER)\n__declspec(dllexport)\n#endif\n"
+
+# Seconds a single command may run before the suite kills it and fails the
+# test, so a hung bake never stalls the whole run.
+COMMAND_TIMEOUT = float(os.environ.get("BAKE_TEST_COMMAND_TIMEOUT", "300"))
+
+
+def kill_process_tree(proc: subprocess.Popen, sig: int = signal.SIGKILL if hasattr(signal, "SIGKILL") else signal.SIGTERM) -> None:
+    """Kill proc and the processes it started.
+
+    Killing only bake leaves the program it runs alive, holding the output
+    pipe open (so reads and waits never return) and, on Windows, locking files
+    under test/tmp. On POSIX the process must have been started with
+    start_new_session=True for its group to be killed.
+    """
+    if proc.poll() is not None:
+        return
+    if platform.system() == "Windows":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=60, check=False)
+    else:
+        try:
+            # Never the suite's own group: a process started without
+            # start_new_session shares it.
+            pgid = os.getpgid(proc.pid)
+            if pgid != os.getpgrp():
+                os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def communicate_or_kill(proc: subprocess.Popen, timeout: float = COMMAND_TIMEOUT) -> tuple[str, str]:
+    """Wait for proc and return its output, killing its tree after timeout.
+
+    subprocess.run(timeout=...) kills only the direct child and then waits
+    for the pipes again, which on Windows hangs while a grandchild holds them.
+    """
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_process_tree(proc)
+        try:
+            out, err = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+        raise AssertionError(
+            f"Command timed out after {timeout:.0f}s and was killed\n"
+            f"cmd: {' '.join(map(str, proc.args))}\n"
+            f"output:\n{out or ''}{err or ''}") from None
+    return out or "", err or ""
+
 
 @dataclass(frozen=True)
 class ListState:
@@ -55,9 +113,69 @@ class BakeTests(unittest.TestCase):
         cls.git_snapshot_before = cls.git_snapshot()
 
         cls._remove_stale_build_state()
-        cls.run_cmd(["make", "clean"])
-        cls.run_cmd(["make", "-j", "8"])
+        if cls._use_msvc():
+            shutil.rmtree(cls.repo_root / "build", ignore_errors=True)
+            cls.msvc_build()
+        else:
+            cls.run_cmd(["make", "clean"])
+            cls.run_cmd(["make", "-j", "8"])
         cls.bake(["setup", "--local"])
+
+    @staticmethod
+    def _use_msvc() -> bool:
+        """Whether to build bake with MSVC instead of the Makefile.
+
+        The Makefile drives gcc-style compilers through make; a Windows shell
+        set up for Visual Studio (such as box's launch_box.ps1) has cl but
+        usually no make.
+        """
+        return (platform.system() == "Windows"
+                and shutil.which("make") is None
+                and shutil.which("cl") is not None)
+
+    @classmethod
+    def msvc_build(cls, unit: bool = False) -> None:
+        """Build build/bake.exe, or build/bake_unit_tests.exe with unit, with cl.
+
+        Mirrors the Makefile: every source compiles to its own object (sources
+        in different folders share file names), and the unit tests link every
+        object but main's.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        obj_dir = cls.repo_root / "build" / "obj"
+        obj_dir.mkdir(parents=True, exist_ok=True)
+        common = ["cl", "/nologo", "/std:c11", "/W3", "/Zi", "/Od", "/MD", "/utf-8", "/FS",
+                  "/D_CRT_SECURE_NO_WARNINGS", f"/Fd{obj_dir / 'bake.pdb'}"]
+        units: list[tuple[str, list[str]]] = []
+        for src in sorted((cls.repo_root / "src").rglob("*.c")):
+            rel = src.relative_to(cls.repo_root).as_posix()
+            units.append((rel, ["/Iinclude", "/Ideps", "/Isrc"]))
+        units.append(("deps/parson.c", ["/Ideps"]))
+        units.append(("deps/flecs.c", ["/DFLECS_CUSTOM_BUILD", "/DFLECS_LOG",
+                                       "/DFLECS_OS_API_IMPL", "/Ideps"]))
+        if unit:
+            units.append(("test/unit/unit_tests.c", ["/Iinclude", "/Ideps", "/Isrc"]))
+
+        def compile_unit(entry: tuple[str, list[str]]) -> Path:
+            rel, flags = entry
+            obj = obj_dir / (rel.replace("/", "_")[:-2] + ".obj")
+            src = cls.repo_root / rel
+            if not obj.exists() or obj.stat().st_mtime < src.stat().st_mtime:
+                cls.run_cmd([*common, *flags, "/c", rel, f"/Fo{obj}"])
+            return obj
+
+        with ThreadPoolExecutor(max_workers=os.cpu_count() or 8) as pool:
+            objs = list(pool.map(compile_unit, units))
+
+        if unit:
+            objs = [o for o in objs if o.name != "src_main.obj"]
+            out = cls.repo_root / "build" / "bake_unit_tests.exe"
+        else:
+            objs = [o for o in objs if o.name != "test_unit_unit_tests.obj"]
+            out = cls.bake_bin
+        cls.run_cmd(["link", "/nologo", "/DEBUG", f"/OUT:{out}",
+                     *map(str, objs), "dbghelp.lib", "ws2_32.lib"])
 
     @classmethod
     def _remove_stale_build_state(cls) -> None:
@@ -94,6 +212,10 @@ class BakeTests(unittest.TestCase):
         and diverges from the empty test/tmp that CI starts every job with.
         Set BAKE_TEST_KEEP_TMP=1 to keep the trees for debugging.
         """
+        # Stop what the test started (see stop_process) before its trees are
+        # removed: on Windows a running program locks its files.
+        self.doCleanups()
+
         if os.environ.get("BAKE_TEST_KEEP_TMP"):
             return
 
@@ -109,6 +231,54 @@ class BakeTests(unittest.TestCase):
             else:
                 entry.unlink(missing_ok=True)
 
+    def load_library(self, path: str) -> ctypes.CDLL:
+        """Load a shared library the test built, unloading it again at cleanup:
+        Windows cannot delete a DLL that is still loaded."""
+        lib = ctypes.CDLL(path)
+        self.addCleanup(self.unload_library, lib)
+        return lib
+
+    @staticmethod
+    def unload_library(lib: ctypes.CDLL) -> None:
+        """Unload a library from load_library before the test deletes it;
+        does nothing when it is already unloaded or off Windows."""
+        if platform.system() != "Windows" or not lib._handle:
+            return
+        free = ctypes.WinDLL("kernel32").FreeLibrary
+        free.argtypes = [ctypes.c_void_p]
+        free(lib._handle)
+        lib._handle = 0
+
+    @staticmethod
+    def windows_long_paths_enabled() -> bool:
+        """True unless this is Windows with paths limited to MAX_PATH."""
+        if platform.system() != "Windows":
+            return True
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                r"SYSTEM\CurrentControlSet\Control\FileSystem") as key:
+                return winreg.QueryValueEx(key, "LongPathsEnabled")[0] == 1
+        except OSError:
+            return False
+
+    @staticmethod
+    def stop_process(proc: subprocess.Popen, sig: int | None = None) -> None:
+        """Cleanup for a process a test started with Popen: kill it and its
+        children, and wait for it within a bound so a stuck process fails the
+        test instead of stalling the suite."""
+        if sig is None:
+            kill_process_tree(proc)
+        else:
+            kill_process_tree(proc, sig)
+        try:
+            proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            pass
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
+
     @classmethod
     def _require_supported_os(cls) -> None:
         if platform.system() not in {"Linux", "Darwin", "Windows"}:
@@ -122,25 +292,31 @@ class BakeTests(unittest.TestCase):
         env: dict[str, str] | None = None,
     ) -> str:
         run_cwd = str(cwd if cwd is not None else cls.repo_root)
-        proc = subprocess.run(
-            args,
-            cwd=run_cwd,
-            env=env if env is not None else cls.env,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-
-        output = (proc.stdout or "") + (proc.stderr or "")
-        if proc.returncode != 0:
+        returncode, output = cls._run(args, run_cwd, env)
+        if returncode != 0:
             raise AssertionError(
                 "Command failed with non-zero exit status\n"
                 f"cwd: {run_cwd}\n"
                 f"cmd: {' '.join(args)}\n"
-                f"exit code: {proc.returncode}\n"
+                f"exit code: {returncode}\n"
                 f"output:\n{output}"
             )
         return output
+
+    @classmethod
+    def _run(cls, args: list[str], cwd: str, env: dict[str, str] | None) -> tuple[int, str]:
+        """Run args and return its exit code and output, failing the test
+        instead of hanging when it runs longer than COMMAND_TIMEOUT."""
+        proc = subprocess.Popen(
+            args,
+            cwd=cwd,
+            env=env if env is not None else cls.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        out, err = communicate_or_kill(proc)
+        return proc.returncode, out + err
 
     @classmethod
     def bake(
@@ -159,17 +335,8 @@ class BakeTests(unittest.TestCase):
         env: dict[str, str] | None = None,
     ) -> str:
         run_cwd = str(cwd if cwd is not None else cls.repo_root)
-        proc = subprocess.run(
-            [str(cls.bake_bin), *args],
-            cwd=run_cwd,
-            env=env if env is not None else cls.env,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-
-        output = (proc.stdout or "") + (proc.stderr or "")
-        if proc.returncode == 0:
+        returncode, output = cls._run([str(cls.bake_bin), *args], run_cwd, env)
+        if returncode == 0:
             raise AssertionError(
                 "Expected command to fail but it succeeded\n"
                 f"cwd: {run_cwd}\n"
@@ -312,7 +479,10 @@ class BakeTests(unittest.TestCase):
         end-to-end tests, which report their edge cases as unrelated build
         failures.
         """
-        self.run_cmd(["make", "unit"])
+        if self._use_msvc():
+            self.msvc_build(unit=True)
+        else:
+            self.run_cmd(["make", "unit"])
         unit_bin = self.repo_root / "build" / f"bake_unit_tests{EXE_SUFFIX}"
         output = self.run_cmd([str(unit_bin)])
         self.assertIn("0 failures", output, output)
@@ -481,7 +651,7 @@ class BakeTests(unittest.TestCase):
             "// Comment out this line when using as DLL\n"
             "#define examples_c_pkg_amalgamate_shared_STATIC\n"))
 
-        lib = ctypes.CDLL(str(library))
+        lib = self.load_library(str(library))
         self.assertEqual(lib.examples_shared_value(), 42)
         self.assertFalse(hasattr(lib, "examples_shared_extra"))
 
@@ -505,23 +675,30 @@ class BakeTests(unittest.TestCase):
             ["--amalgamate", "examples_c_pkg_amalgamate_shared", "--trace"],
             cwd=project_dir))
 
+        # bake drives MSVC on Windows, which spells flags /c and /D and has
+        # no libm (bake drops "m" from its libraries).
+        msvc = platform.system() == "Windows"
+        compile_flag = " /c " if msvc else " -c "
         compile_lines = [line for line in output.splitlines()
-                         if " -c " in line and "examples_c_pkg_amalgamate_shared.c" in line]
+                         if compile_flag in line and "examples_c_pkg_amalgamate_shared.c" in line]
         self.assertEqual(len(compile_lines), 1, output)
         compile_line = compile_lines[0]
-        self.assertIn("-Dexamples_c_pkg_amalgamate_shared_EXPORTS", compile_line)
+        self.assertIn(("/D" if msvc else "-D") + "examples_c_pkg_amalgamate_shared_EXPORTS",
+                      compile_line)
         self.assertNotIn("EXAMPLES_SHARED_PARENT_ONLY", compile_line)
-        if platform.system() != "Windows":
+        if not msvc:
             self.assertIn("-fPIC", compile_line)
 
         library_name = self.shared_library_name("examples_c_pkg_amalgamate_shared")
         link_lines = [line for line in output.splitlines()
-                      if library_name in line and " -c " not in line]
+                      if library_name in line and compile_flag not in line
+                      and not line.startswith("   Creating library")]
         self.assertEqual(len(link_lines), 1, output)
-        self.assertIn("-lm", link_lines[0])
+        if not msvc:
+            self.assertIn("-lm", link_lines[0])
 
         gen_dir = project_dir / ".bake" / "amalgamate" / "examples_c_pkg_amalgamate_shared"
-        lib = ctypes.CDLL(str(self.amalgamate_build_root(gen_dir) / library_name))
+        lib = self.load_library(str(self.amalgamate_build_root(gen_dir) / library_name))
         self.assertEqual(lib.examples_shared_value(), 42)
         self.assertEqual(lib.examples_shared_extra(), 7)
 
@@ -535,7 +712,7 @@ class BakeTests(unittest.TestCase):
 
         self.assertEqual(distr_source.read_text(), expected)
         gen_dir = project_dir / ".bake" / "amalgamate" / "shared_mini"
-        lib = ctypes.CDLL(str(
+        lib = self.load_library(str(
             self.amalgamate_build_root(gen_dir) / self.shared_library_name("shared_mini")))
         self.assertEqual(lib.examples_shared_value(), 42)
 
@@ -610,14 +787,14 @@ class BakeTests(unittest.TestCase):
     def test_amalgamate_option_uses_files_in_the_project_root(self) -> None:
         project_dir, _ = self.write_simple_app_project(
             "amalg_root_files", "int main(void) { return 0; }\n")
-        (project_dir / "rootlib.h").write_text("int rootlib_value(void);\n")
+        (project_dir / "rootlib.h").write_text(DLL_EXPORT + "int rootlib_value(void);\n")
         (project_dir / "rootlib.c").write_text(
             '#include "rootlib.h"\nint rootlib_value(void) { return 5; }\n')
 
         self.bake(["--amalgamate", "rootlib"], cwd=project_dir)
 
         gen_dir = project_dir / ".bake" / "amalgamate" / "rootlib"
-        lib = ctypes.CDLL(str(
+        lib = self.load_library(str(
             self.amalgamate_build_root(gen_dir) / self.shared_library_name("rootlib")))
         self.assertEqual(lib.rootlib_value(), 5)
         self.assertEqual(
@@ -631,7 +808,7 @@ class BakeTests(unittest.TestCase):
             '#include "amalg_same.h"\nint amalg_same_value(void) { return 3; }\n')
         (project_dir / "include").mkdir()
         (project_dir / "include" / "amalg_same.h").write_text(
-            "int amalg_same_value(void);\n")
+            DLL_EXPORT + "int amalg_same_value(void);\n")
         (project_dir / "project.json").write_text(
             '{\n'
             '    "id": "amalg_same",\n'
@@ -650,7 +827,9 @@ class BakeTests(unittest.TestCase):
         self.assertTrue(static_lib.is_file(), f"Expected parent library at {static_lib}")
         self.assertTrue(shared_lib.is_file(), f"Expected shared library at {shared_lib}")
         self.assertFalse((project_dir / ".bake" / "amalgamate").exists())
-        self.assertEqual(ctypes.CDLL(str(shared_lib)).amalg_same_value(), 3)
+        lib = self.load_library(str(shared_lib))
+        self.assertEqual(lib.amalg_same_value(), 3)
+        self.unload_library(lib)
 
         self.bake(["clean", "--amalgamate", "amalg_same", "--local-env=amalg"],
                   cwd=project_dir)
@@ -3505,9 +3684,12 @@ class BakeTests(unittest.TestCase):
              *bench_args, "--json", str(baseline)],
             cwd=project_dir)
 
+        # Samples this short vary by more than the default 5% threshold on a
+        # busy machine (+160% was seen on Windows), so the same code is
+        # compared with a threshold noise cannot cross.
         output = self.strip_ansi(self.bake(
             ["--local-env=bench_baseline", "run", ".", "--",
-             *bench_args, "--baseline", str(baseline)],
+             *bench_args, "--baseline", str(baseline), "--threshold", "10"],
             cwd=project_dir))
         self.assertIn("vs baseline", output)
         self.assertIn("0 regression(s)", output)
@@ -3764,6 +3946,7 @@ class BakeTests(unittest.TestCase):
         self.assertEqual([child["name"] for child in links[0]["children"]], ["embed"])
         self.assertEqual(report["totals"]["project"][app_id]["files"], 1)
 
+    @unittest.skipIf(shutil.which("cloc") is None, "cloc not available on PATH")
     def test_build_json_reports_lines_of_code(self) -> None:
         project_dir, app_id = self.write_build_json_app("build_json_loc")
         (project_dir / "include").mkdir()
@@ -3795,6 +3978,7 @@ class BakeTests(unittest.TestCase):
         self.assertEqual(workspace_loc["code"], project_loc["code"])
         self.assertEqual(workspace_loc["by_language"], project_loc["by_language"])
 
+    @unittest.skipIf(shutil.which("cloc") is None, "cloc not available on PATH")
     def test_build_json_reports_lines_of_code_per_file(self) -> None:
         project_dir, app_id = self.write_build_json_app("build_json_loc_by_file")
         (project_dir / "include" / "sub").mkdir(parents=True)
@@ -4296,15 +4480,7 @@ class BakeTests(unittest.TestCase):
             start_new_session=True,
         )
 
-        def stop_group() -> None:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                proc.kill()
-
-        self.addCleanup(proc.stdout.close)
-        self.addCleanup(proc.wait)
-        self.addCleanup(stop_group)
+        self.addCleanup(self.stop_process, proc)
 
         matched = self.ps_wait_for(env, lambda entry: entry["project"] == app_id)
         self.assertTrue(matched, f"bake ps did not list {app_id}")
@@ -4325,7 +4501,9 @@ class BakeTests(unittest.TestCase):
         table = self.strip_ansi(self.bake(["ps"], env=env))
         self.assertIn(str(entry["pid"]), table)
         self.assertIn(f"local:{env_name}", table)
-        self.assertIn("PID", table.splitlines()[0])
+        # Windows warns first that only registered processes are listed.
+        header = next(line for line in table.splitlines() if not line.startswith("[warning]"))
+        self.assertIn("PID", header)
 
         self.bake(["ps", "--kill", env_name], env=env)
         self.assertTrue(
@@ -4334,7 +4512,7 @@ class BakeTests(unittest.TestCase):
         )
         proc.wait(timeout=60)
 
-        output = self.strip_ansi(proc.stdout.read())
+        output = self.strip_ansi(communicate_or_kill(proc, 60)[0])
         self.assertIn(f"started {app_id}", output)
         self.assertIn("bake3 ps", output)
 
@@ -4362,8 +4540,7 @@ class BakeTests(unittest.TestCase):
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        self.addCleanup(proc.wait)
-        self.addCleanup(proc.kill)
+        self.addCleanup(self.stop_process, proc)
 
         matched = self.ps_wait_for(env, lambda entry: entry["pid"] == proc.pid)
         if not matched and platform.system() == "Windows":
@@ -4402,15 +4579,7 @@ class BakeTests(unittest.TestCase):
             start_new_session=True,
         )
 
-        def stop_group() -> None:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError, OSError):
-                proc.kill()
-
-        self.addCleanup(proc.stdout.close)
-        self.addCleanup(proc.wait)
-        self.addCleanup(stop_group)
+        self.addCleanup(self.stop_process, proc)
 
         matched = self.ps_wait_for(env, lambda entry: entry["project"] == app_id)
         self.assertTrue(matched, f"bake ps did not list {app_id}")
@@ -4457,7 +4626,7 @@ class BakeTests(unittest.TestCase):
         )
         proc.wait(timeout=60)
 
-        started = self.strip_ansi(proc.stdout.read())
+        started = self.strip_ansi(communicate_or_kill(proc, 60)[0])
         self.assertIn("env local)", started)
 
     def test_ps_kill_rejects_unknown_targets(self) -> None:
@@ -4846,11 +5015,24 @@ class BakeTests(unittest.TestCase):
         root = self.repo_root / "test" / "tmp" / f"{name}_{stamp}"
         (root / "src").mkdir(parents=True)
         log = root / "lint.log"
+        # bake lints files in parallel, and Windows has no atomic append, so
+        # the log is written under a lock (a directory, created atomically).
+        # The path is logged normalized: on Windows bake passes it with mixed
+        # separators.
         (root / "lint.py").write_text(
-            "import sys\n"
+            "import os, sys, time\n"
             "path, action = sys.argv[1], sys.argv[2]\n"
-            "with open('lint.log', 'a') as f:\n"
-            "    f.write(path + ' ' + action + '\\n')\n"
+            "while True:\n"
+            "    try:\n"
+            "        os.mkdir('lint.lock')\n"
+            "        break\n"
+            "    except FileExistsError:\n"
+            "        time.sleep(0.01)\n"
+            "try:\n"
+            "    with open('lint.log', 'a') as f:\n"
+            "        f.write(os.path.normpath(path) + ' ' + action + '\\n')\n"
+            "finally:\n"
+            "    os.rmdir('lint.lock')\n"
             "text = open(path).read()\n"
             "if action == 'autofix':\n"
             "    text = text.replace('LINT_BAD', 'LINT_OK')\n"
@@ -5546,17 +5728,9 @@ class BakeTests(unittest.TestCase):
             start_new_session=True,
         )
 
-        def stop_server_group() -> None:
-            # bake spawns the web server as a child, so terminating bake alone
-            # leaves the port bound.
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                proc.terminate()
-
-        self.addCleanup(proc.stdout.close)
-        self.addCleanup(proc.wait)
-        self.addCleanup(stop_server_group)
+        # bake spawns the web server as a child, so terminating bake alone
+        # leaves the port bound.
+        self.addCleanup(self.stop_process, proc, signal.SIGTERM)
 
         url = None
         deadline = time.time() + 60
@@ -6667,6 +6841,14 @@ class BakeTests(unittest.TestCase):
         self.require_cmake_bundle_tools()
         stamp = int(time.time() * 1_000_000)
         root = self.repo_root / "test" / "tmp" / f"bundle_commit_{stamp}"
+        # A pinned bundle builds under .bake/bundles/<id>/commits/<sha>/build,
+        # where the files MSBuild writes for its CMake probe pass MAX_PATH
+        # unless the checkout is near the drive root.
+        build_dir = (root / "mathpkg" / ".bake" / "bundles" / "calc" / "commits" / ("0" * 40)
+                     / "build" / "x64-Windows-debug")
+        if len(str(build_dir)) + 110 > 260 and not self.windows_long_paths_enabled():
+            self.skipTest("Windows long paths are disabled and the pinned bundle build "
+                          "path exceeds MAX_PATH")
         repo = root / "calc_repo"
 
         self.write_cmake_bundle_source(repo, 11)
