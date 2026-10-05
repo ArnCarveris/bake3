@@ -13,12 +13,11 @@
 ECS_COMPONENT_DECLARE(BakeBuildRequest);
 ECS_COMPONENT_DECLARE(BakeBuildResult);
 
-char* bake_project_build_root(const char *project_path, const char *project_id, const char *mode) {
+char* bake_project_build_base(const char *project_path, const char *project_id) {
     if (!project_path || !project_path[0]) {
         return NULL;
     }
 
-    char *triplet = bake_host_triplet(mode);
     const char *bake_home = bake_env_home();
     if (bake_env_is_local() &&
         bake_home &&
@@ -27,20 +26,36 @@ char* bake_project_build_root(const char *project_path, const char *project_id, 
         project_id[0])
     {
         char *build_dir = bake_path_join(bake_home, "build");
-        char *project_dir = bake_path_join(build_dir, project_id);
+        char *base = bake_path_join(build_dir, project_id);
         ecs_os_free(build_dir);
+        return base;
+    }
 
-        char *root = bake_path_join(project_dir, triplet);
-        ecs_os_free(project_dir);
+    return bake_path_join(project_path, ".bake");
+}
+
+char* bake_project_build_root(const char *project_path, const char *project_id, const char *mode) {
+    char *base = bake_project_build_base(project_path, project_id);
+    if (!base) {
+        return NULL;
+    }
+
+    char *triplet = bake_host_triplet(mode);
+    char *root = bake_path_join(base, triplet);
+    ecs_os_free(triplet);
+    ecs_os_free(base);
+    return root;
+}
+
+char* bake_project_cfg_build_root(const bake_project_cfg_t *cfg, const char *mode) {
+    if (cfg->build_dir && cfg->build_dir[0]) {
+        char *triplet = bake_host_triplet(mode);
+        char *root = bake_path_join(cfg->build_dir, triplet);
         ecs_os_free(triplet);
         return root;
     }
 
-    char *bake_dir = bake_path_join(project_path, ".bake");
-    char *root = bake_path_join(bake_dir, triplet);
-    ecs_os_free(triplet);
-    ecs_os_free(bake_dir);
-    return root;
+    return bake_project_build_root(cfg->path, cfg->id, mode);
 }
 
 static const char *bake_standalone_deps_marker = ".bake_standalone_deps";
@@ -545,7 +560,7 @@ static int bake_build_one(bake_context_t *ctx, ecs_entity_t project_entity, cons
     if (bake_amalgamate_list_count(&cfg->amalgamate) > 0) {
         int32_t amalg_step = bake_report_open(ctx->report,
             BAKE_REPORT_KIND_GENERATE, "amalgamate", cfg->id);
-        int amalg_rc = bake_generate_project_amalgamation(cfg);
+        int amalg_rc = bake_generate_project_amalgamation(cfg, NULL);
         bake_report_close(ctx->report, amalg_step, amalg_rc == 0,
             amalg_rc == 0 ? NULL : "amalgamation failed");
         if (amalg_rc != 0) {
@@ -615,6 +630,16 @@ static int bake_build_one(bake_context_t *ctx, ecs_entity_t project_entity, cons
     bake_add_mode_flags(request->mode, ctx->compiler_kind, &mode_cflags, &mode_cxxflags, &mode_ldflags);
     bake_add_strict_flags(ctx->opts.strict, ctx->compiler_kind, &mode_cflags, &mode_cxxflags, &mode_ldflags);
     bake_add_coverage_flags(ctx->opts.coverage, &mode_cflags, &mode_cxxflags, &mode_ldflags);
+
+#if !defined(_WIN32)
+    if (cfg->shared_library &&
+        ctx->compiler_kind != BAKE_COMPILER_MSVC &&
+        !bake_target_is_emscripten())
+    {
+        bake_strlist_append(&mode_cflags, "-fPIC");
+        bake_strlist_append(&mode_cxxflags, "-fPIC");
+    }
+#endif
 
     if (bake_project_kind_is_harness(cfg->kind) &&
         ctx->compiler_kind != BAKE_COMPILER_MSVC &&
@@ -822,6 +847,31 @@ static int bake_prepare_build_graph_bundles(
     return rc;
 }
 
+static int bake_stage_amalgamate_targets(
+    bake_context_t *ctx,
+    const ecs_entity_t *order,
+    int32_t count)
+{
+    for (int32_t i = 0; i < count; i++) {
+        if (!ecs_has(ctx->world, order[i], BakeBuildRequest)) {
+            continue;
+        }
+
+        const BakeProject *project = ecs_get(ctx->world, order[i], BakeProject);
+        if (!project || !project->cfg || project->external ||
+            !project->cfg->amalgamate_src)
+        {
+            continue;
+        }
+
+        if (bake_amalgamate_target_stage(ctx, project->cfg) != 0) {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
 static int bake_execute_build_graph(bake_context_t *ctx, const char *target, bool recursive, bool standalone) {
     bake_model_mark_build_targets(ctx->world, target, ctx->opts.mode, recursive, standalone);
 
@@ -838,6 +888,8 @@ static int bake_execute_build_graph(bake_context_t *ctx, const char *target, boo
     if (bake_prepare_build_graph_bundles(ctx, order, count) != 0) goto cleanup;
 
     if (bake_validate_build_graph_dependencies(ctx->world, order, count) != 0) goto cleanup;
+
+    if (bake_stage_amalgamate_targets(ctx, order, count) != 0) goto cleanup;
 
     bake_report_collect_loc(ctx, order, count);
 
@@ -880,10 +932,22 @@ static int bake_prepare_discovery(bake_context_t *ctx, char **target_path_out) {
     const char *target = bake_effective_build_target(ctx);
     char *target_path = bake_resolve_target_path(ctx, target);
     char *target_root = NULL;
+    char *amalgamate_target = NULL;
     if (target_path) {
         target_root = bake_path_is_dir(target_path)
             ? ecs_os_strdup(target_path)
             : bake_path_dirname(target_path);
+    }
+
+    if (ctx->opts.amalgamate) {
+        if (!target_path) {
+            ecs_err("target not found: %s (--amalgamate requires a project "
+                "directory)", target);
+            goto cleanup;
+        }
+        if (bake_amalgamate_target_add(ctx, target_root, &amalgamate_target) != 0) {
+            goto cleanup;
+        }
     }
 
     if (target_root && bake_discover_projects(ctx, target_root, true) < 0) {
@@ -908,16 +972,43 @@ static int bake_prepare_discovery(bake_context_t *ctx, char **target_path_out) {
 cleanup:
     bake_report_close(ctx->report, step, rc == 0,
         rc == 0 ? NULL : "project discovery failed");
+    if (rc == 0 && amalgamate_target) {
+        ecs_os_free(target_path);
+        target_path = amalgamate_target;
+        amalgamate_target = NULL;
+    }
     if (rc == 0 && target_path_out) {
         *target_path_out = target_path;
         target_path = NULL;
     }
+    ecs_os_free(amalgamate_target);
     ecs_os_free(target_path);
     ecs_os_free(target_root);
     return rc;
 }
 
+static int bake_clean_generated_project(const bake_project_cfg_t *cfg) {
+    int rc = 0;
+    if (bake_path_exists(cfg->build_dir) && bake_path_is_dir(cfg->build_dir)) {
+        rc = bake_os_rmtree(cfg->build_dir);
+    }
+
+    if (rc == 0) {
+        char *parent = bake_path_dirname(cfg->build_dir);
+        if (parent && bake_path_is_dir(parent)) {
+            bake_os_rmdir(parent);
+        }
+        ecs_os_free(parent);
+    }
+
+    return rc;
+}
+
 static int bake_clean_project(const bake_context_t *ctx, const bake_project_cfg_t *cfg) {
+    if (cfg->build_dir && cfg->build_dir[0]) {
+        return bake_clean_generated_project(cfg);
+    }
+
     char *bake_dir = NULL;
     if (ctx && ctx->opts.local_env && ctx->bake_home && cfg->id && cfg->id[0]) {
         char *build_root = bake_path_join(ctx->bake_home, "build");

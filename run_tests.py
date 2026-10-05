@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import ctypes
 import json
 import os
 import platform
@@ -434,6 +435,260 @@ class BakeTests(unittest.TestCase):
         self.assertNotIn("EXAMPLES_FLAG_OFF", regenerated)
         self.assertNotIn("EXAMPLES_FEATURE_REMOVED", regenerated)
         self.assertEqual(regenerated, stripped)
+
+    def copy_amalgamate_shared_project(self, name: str) -> Path:
+        stamp = int(time.time() * 1_000_000)
+        project_dir = self.repo_root / "test" / "tmp" / f"{name}_{stamp}"
+        self.addCleanup(shutil.rmtree, project_dir, ignore_errors=True)
+        shutil.copytree(
+            self.repo_root / "test" / "projects" / "c" / "pkg_amalgamate_shared",
+            project_dir,
+            ignore=shutil.ignore_patterns(".bake"),
+        )
+        return project_dir
+
+    @staticmethod
+    def shared_library_name(output: str) -> str:
+        if platform.system() == "Windows":
+            return f"{output}.dll"
+        if platform.system() == "Darwin":
+            return f"lib{output}.dylib"
+        return f"lib{output}.so"
+
+    def amalgamate_build_root(self, gen_dir: Path, cfg: str = "debug") -> Path:
+        return gen_dir / f"{self.host_arch()}-{platform.system()}-{cfg}"
+
+    def test_amalgamate_option_builds_shared_library(self) -> None:
+        project_dir = self.copy_amalgamate_shared_project("amalg_shared")
+        gen_dir = project_dir / ".bake" / "amalgamate" / "shared_mini"
+
+        output = self.strip_ansi(
+            self.bake(["--amalgamate", "shared_mini"], cwd=project_dir))
+        self.assertIn("package shared_mini => '.bake/amalgamate/shared_mini'", output)
+
+        library = self.amalgamate_build_root(gen_dir) / self.shared_library_name("shared_mini")
+        self.assertTrue(library.is_file(), f"Expected shared library at {library}")
+        self.assertEqual(
+            sorted(p.name for p in (gen_dir / "src").iterdir()),
+            ["shared_mini.c", "shared_mini.h"])
+        self.assertTrue((gen_dir / "project.json").is_file())
+
+        staged_header = (gen_dir / "src" / "shared_mini.h").read_text()
+        self.assertTrue(staged_header.startswith(
+            "// Comment out this line when using as DLL\n"
+            "// #define examples_c_pkg_amalgamate_shared_STATIC\n"))
+        self.assertTrue((project_dir / "distr" / "shared_mini.h").read_text().startswith(
+            "// Comment out this line when using as DLL\n"
+            "#define examples_c_pkg_amalgamate_shared_STATIC\n"))
+
+        lib = ctypes.CDLL(str(library))
+        self.assertEqual(lib.examples_shared_value(), 42)
+        self.assertFalse(hasattr(lib, "examples_shared_extra"))
+
+        self.assertEqual(
+            list(project_dir.glob(".bake/*/libpkg_amalgamate_shared*")), [],
+            "The parent project must not be built")
+        self.assertNotIn("shared_mini", self.list_state().package_names)
+        self.assertNotIn("examples.c.pkg_amalgamate_shared", self.list_state().package_names)
+        self.assertEqual(
+            sorted(p.name for p in project_dir.iterdir()),
+            [".bake", "distr", "include", "project.json", "src"])
+
+        again = self.strip_ansi(
+            self.bake(["--amalgamate", "shared_mini"], cwd=project_dir))
+        self.assertNotRegex(again, r"\d+%\]")
+
+    def test_amalgamate_option_compiles_like_a_standalone_consumer(self) -> None:
+        project_dir = self.copy_amalgamate_shared_project("amalg_flags")
+
+        output = self.strip_ansi(self.bake(
+            ["--amalgamate", "examples_c_pkg_amalgamate_shared", "--trace"],
+            cwd=project_dir))
+
+        compile_lines = [line for line in output.splitlines()
+                         if " -c " in line and "examples_c_pkg_amalgamate_shared.c" in line]
+        self.assertEqual(len(compile_lines), 1, output)
+        compile_line = compile_lines[0]
+        self.assertIn("-Dexamples_c_pkg_amalgamate_shared_EXPORTS", compile_line)
+        self.assertNotIn("EXAMPLES_SHARED_PARENT_ONLY", compile_line)
+        if platform.system() != "Windows":
+            self.assertIn("-fPIC", compile_line)
+
+        library_name = self.shared_library_name("examples_c_pkg_amalgamate_shared")
+        link_lines = [line for line in output.splitlines()
+                      if library_name in line and " -c " not in line]
+        self.assertEqual(len(link_lines), 1, output)
+        self.assertIn("-lm", link_lines[0])
+
+        gen_dir = project_dir / ".bake" / "amalgamate" / "examples_c_pkg_amalgamate_shared"
+        lib = ctypes.CDLL(str(self.amalgamate_build_root(gen_dir) / library_name))
+        self.assertEqual(lib.examples_shared_value(), 42)
+        self.assertEqual(lib.examples_shared_extra(), 7)
+
+    def test_amalgamate_option_regenerates_stale_amalgamation(self) -> None:
+        project_dir = self.copy_amalgamate_shared_project("amalg_stale")
+        distr_source = project_dir / "distr" / "shared_mini.c"
+        expected = distr_source.read_text()
+        distr_source.write_text(expected.replace("return 42;", "return 1;"))
+
+        self.bake(["--amalgamate", "shared_mini"], cwd=project_dir)
+
+        self.assertEqual(distr_source.read_text(), expected)
+        gen_dir = project_dir / ".bake" / "amalgamate" / "shared_mini"
+        lib = ctypes.CDLL(str(
+            self.amalgamate_build_root(gen_dir) / self.shared_library_name("shared_mini")))
+        self.assertEqual(lib.examples_shared_value(), 42)
+
+    def test_amalgamate_option_rebuild_and_clean(self) -> None:
+        project_dir = self.copy_amalgamate_shared_project("amalg_clean")
+        amalg_root = project_dir / ".bake" / "amalgamate"
+
+        self.bake(["--amalgamate", "shared_mini", str(project_dir)])
+        output = self.strip_ansi(self.bake(
+            ["rebuild", "--amalgamate", "examples_c_pkg_amalgamate_shared",
+             str(project_dir)]))
+        self.assertIn("clean] examples_c_pkg_amalgamate_shared", output)
+        self.assertIn("rebuild] package examples_c_pkg_amalgamate_shared", output)
+
+        full = amalg_root / "examples_c_pkg_amalgamate_shared"
+        mini = amalg_root / "shared_mini"
+        self.assertTrue((self.amalgamate_build_root(full) / self.shared_library_name(
+            "examples_c_pkg_amalgamate_shared")).is_file())
+
+        output = self.strip_ansi(self.bake(
+            ["rebuild", "--amalgamate", "shared_mini", str(project_dir)]))
+        self.assertRegex(output, r"\d+%\] shared_mini\.c")
+
+        self.bake(["clean", "--amalgamate", "shared_mini", str(project_dir)])
+        self.assertFalse(mini.exists())
+        self.assertTrue(full.is_dir())
+
+        self.bake(["clean", "--amalgamate", "examples_c_pkg_amalgamate_shared"],
+                  cwd=project_dir)
+        self.assertFalse(amalg_root.exists())
+        self.assertTrue((project_dir / "distr" / "shared_mini.c").is_file())
+
+    def test_amalgamate_option_release_build_json(self) -> None:
+        project_dir = self.copy_amalgamate_shared_project("amalg_json")
+        report_path = project_dir / "report.json"
+
+        self.bake(
+            ["rebuild", "--amalgamate", "shared_mini", "--cfg", "release",
+             "--build-json", str(report_path)],
+            cwd=project_dir)
+
+        gen_dir = project_dir / ".bake" / "amalgamate" / "shared_mini"
+        self.assertTrue((self.amalgamate_build_root(gen_dir, "release") /
+                         self.shared_library_name("shared_mini")).is_file())
+        self.assertFalse(self.amalgamate_build_root(gen_dir, "debug").exists())
+
+        report = json.loads(report_path.read_text())
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["cfg"], "release")
+        self.assertEqual(list(report["totals"]["project"]), ["shared_mini"])
+
+        steps = self.report_steps(report)
+        amalg_steps = [step for step in steps
+                       if step["kind"] == "generate" and step["name"] == "amalgamate"]
+        self.assertEqual([step["project"] for step in amalg_steps], ["shared_mini"])
+
+        compiles = [step for step in steps if step["kind"] == "compile"]
+        self.assertEqual([step["name"] for step in compiles], ["src/shared_mini.c"])
+        self.assertEqual(compiles[0]["project"], "shared_mini")
+        links = [step for step in steps if step["kind"] == "link"]
+        self.assertEqual([step["project"] for step in links], ["shared_mini"])
+
+        project_totals = report["totals"]["project"]["shared_mini"]
+        self.assertEqual(project_totals["files"], 1)
+        self.assertGreater(project_totals["link_sec"], 0.0)
+        if shutil.which("cloc"):
+            self.assertEqual(
+                sorted(project_totals["loc"]["by_file"]),
+                ["src/shared_mini.c", "src/shared_mini.h"])
+            self.assertGreater(project_totals["loc"]["code"], 0)
+
+    def test_amalgamate_option_uses_files_in_the_project_root(self) -> None:
+        project_dir, _ = self.write_simple_app_project(
+            "amalg_root_files", "int main(void) { return 0; }\n")
+        (project_dir / "rootlib.h").write_text("int rootlib_value(void);\n")
+        (project_dir / "rootlib.c").write_text(
+            '#include "rootlib.h"\nint rootlib_value(void) { return 5; }\n')
+
+        self.bake(["--amalgamate", "rootlib"], cwd=project_dir)
+
+        gen_dir = project_dir / ".bake" / "amalgamate" / "rootlib"
+        lib = ctypes.CDLL(str(
+            self.amalgamate_build_root(gen_dir) / self.shared_library_name("rootlib")))
+        self.assertEqual(lib.rootlib_value(), 5)
+        self.assertEqual(
+            sorted(p.name for p in (gen_dir / "src").iterdir()),
+            ["rootlib.c", "rootlib.h"])
+
+    def test_amalgamate_option_local_env_does_not_collide_with_parent(self) -> None:
+        project_dir, _ = self.write_simple_app_project(
+            "amalg_same", "int main(void) { return 0; }\n")
+        (project_dir / "src" / "main.c").write_text(
+            '#include "amalg_same.h"\nint amalg_same_value(void) { return 3; }\n')
+        (project_dir / "include").mkdir()
+        (project_dir / "include" / "amalg_same.h").write_text(
+            "int amalg_same_value(void);\n")
+        (project_dir / "project.json").write_text(
+            '{\n'
+            '    "id": "amalg_same",\n'
+            '    "type": "package",\n'
+            '    "value": {"amalgamate": [{"path": "distr"}]}\n'
+            '}\n')
+
+        self.bake(["build", "--local-env=amalg"], cwd=project_dir)
+        self.bake(["--amalgamate", "amalg_same", "--local-env=amalg"], cwd=project_dir)
+
+        build_root = project_dir / ".bake" / "local_env" / "amalg" / "build" / "amalg_same"
+        static_lib = self.amalgamate_build_root(build_root) / (
+            "amalg_same.lib" if platform.system() == "Windows" else "libamalg_same.a")
+        gen_dir = build_root / "amalgamate" / "amalg_same"
+        shared_lib = self.amalgamate_build_root(gen_dir) / self.shared_library_name("amalg_same")
+        self.assertTrue(static_lib.is_file(), f"Expected parent library at {static_lib}")
+        self.assertTrue(shared_lib.is_file(), f"Expected shared library at {shared_lib}")
+        self.assertFalse((project_dir / ".bake" / "amalgamate").exists())
+        self.assertEqual(ctypes.CDLL(str(shared_lib)).amalg_same_value(), 3)
+
+        self.bake(["clean", "--amalgamate", "amalg_same", "--local-env=amalg"],
+                  cwd=project_dir)
+        self.assertFalse(gen_dir.exists())
+        self.assertTrue(static_lib.is_file())
+
+    def test_amalgamate_option_is_validated(self) -> None:
+        project_dir = self.copy_amalgamate_shared_project("amalg_errors")
+
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["--amalgamate", "missing"], cwd=project_dir))
+        self.assertIn("cannot build amalgamation 'missing'", output)
+        self.assertIn(
+            "available prefixes: examples_c_pkg_amalgamate_shared, shared_mini", output)
+
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["--amalgamate", "../escape"], cwd=project_dir))
+        self.assertIn("invalid --amalgamate prefix", output)
+
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["run", "--amalgamate", "shared_mini"], cwd=project_dir))
+        self.assertIn("--amalgamate can only be used with the build, rebuild and clean", output)
+
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["--amalgamate", "shared_mini", "no_such_dir"], cwd=project_dir))
+        self.assertIn("--amalgamate requires a project directory", output)
+
+        (project_dir / "empty").mkdir()
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["--amalgamate", "shared_mini", "empty"], cwd=project_dir))
+        self.assertIn("no project.json in", output)
+
+        plain_dir, _ = self.write_simple_app_project(
+            "amalg_unconfigured", "int main(void) { return 0; }\n")
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["--amalgamate", "plain"], cwd=plain_dir))
+        self.assertIn("does not configure amalgamation", output)
+        self.assertFalse((plain_dir / ".bake" / "amalgamate").exists())
 
     def test_build_distinguishes_sources_with_colliding_flat_names(self) -> None:
         self.bake(["build", "test/projects/c/app_obj_collision"])
@@ -2134,7 +2389,12 @@ class BakeTests(unittest.TestCase):
         )
 
         self.assertEqual(serial_summaries, expected_summaries)
-        self.assertEqual(parallel_summaries, serial_summaries)
+        self.assertEqual(
+            sorted(parallel_summaries.splitlines()),
+            sorted(serial_summaries.splitlines()),
+        )
+        self.assertTrue(
+            parallel_summaries.splitlines()[-1].endswith(f"({project_id}.all)"))
         expected_cases = [
             f"CASE {suite}.{case}"
             for suite in ("Alpha", "Beta")
@@ -2147,7 +2407,7 @@ class BakeTests(unittest.TestCase):
             line for line in parallel_output.splitlines() if line.startswith("CASE ")
         ]
         self.assertEqual(serial_cases, expected_cases)
-        self.assertEqual(parallel_cases, serial_cases)
+        self.assertEqual(sorted(parallel_cases), sorted(serial_cases))
         self.assertGreater(serial_elapsed, 10.0)
         self.assertLess(
             parallel_elapsed,
@@ -2327,6 +2587,371 @@ class BakeTests(unittest.TestCase):
         self.bake([local_env, "run", "test", "--", "--json", str(report)],
             cwd=root)
         self.assertFalse(coverage.exists())
+
+    def require_coverage_compiler(self) -> None:
+        if platform.system() == "Windows":
+            self.skipTest("coverage is not supported on Windows")
+        compiler = shutil.which("cc")
+        if not compiler:
+            self.skipTest("no C compiler available")
+        version = subprocess.run(
+            [compiler, "--version"], text=True, capture_output=True, check=False)
+        if "clang" not in (version.stdout or ""):
+            self.skipTest("coverage requires clang")
+
+    def write_coverage_workspace(self, name: str) -> tuple[Path, str]:
+        """Write a library with sources in src, src/util and include, and a test."""
+        stamp = int(time.time() * 1_000_000)
+        lib_id = f"tmp.tests.{name}.lib.{stamp}"
+        test_id = f"tmp.tests.{name}.test.{stamp}"
+        root = self.repo_root / "test" / "tmp" / f"{name}_{stamp}"
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        lib_dir = root / "lib"
+        test_dir = root / "test"
+        (lib_dir / "src" / "util").mkdir(parents=True, exist_ok=True)
+        (lib_dir / "include").mkdir(parents=True, exist_ok=True)
+        (test_dir / "src").mkdir(parents=True, exist_ok=True)
+
+        (lib_dir / "project.json").write_text(
+            json.dumps({"id": lib_id, "type": "package"}, indent=4) + "\n")
+        (lib_dir / "include" / "covlib.h").write_text(
+            "int covlib_sign(int x);\n"
+            "int covlib_unused(void);\n"
+            "int covlib_extra(int x);\n"
+            "static inline int covlib_twice(int x) {\n"
+            "    return x * 2;\n"
+            "}\n"
+        )
+        (lib_dir / "src" / "covlib.c").write_text(
+            "#include <covlib.h>\n"
+            "int covlib_sign(int x) {\n"
+            "    if (x > 0) {\n"
+            "        return 1;\n"
+            "    }\n"
+            "    return -1;\n"
+            "}\n"
+            "int covlib_unused(void) {\n"
+            "    return 42;\n"
+            "}\n"
+        )
+        (lib_dir / "src" / "util" / "extra.c").write_text(
+            "#include <covlib.h>\n"
+            "int covlib_extra(int x) {\n"
+            "    return x + 1;\n"
+            "}\n"
+        )
+        (test_dir / "project.json").write_text(
+            json.dumps(
+                {
+                    "id": test_id,
+                    "type": "test",
+                    "value": {"use": [lib_id]},
+                    "test": {
+                        "testsuites": [
+                            {"id": "Sign", "testcases": ["pos", "neg"]},
+                        ]
+                    },
+                },
+                indent=4,
+            ) + "\n"
+        )
+        (test_dir / "src" / "Sign.c").write_text(
+            "#include <bake_test.h>\n"
+            "#include <covlib.h>\n"
+            "void Sign_pos(void) { test_int(covlib_sign(3), 1); }\n"
+            "void Sign_neg(void) {\n"
+            "    test_int(covlib_sign(-3), -1);\n"
+            "    test_int(covlib_twice(covlib_extra(1)), 4);\n"
+            "}\n"
+        )
+        return root, test_id
+
+    def test_coverage_report_paths_are_relative_to_the_root(self) -> None:
+        self.require_coverage_compiler()
+        root, test_id = self.write_coverage_workspace("coverage_root")
+        local_env = "--local-env=coverage"
+        report = root / "report.json"
+        coverage = root / "report.coverage.json"
+
+        self.bake(
+            [local_env, "run", "test", "--coverage", "--", "--json", str(report)],
+            cwd=root)
+        data = json.loads(coverage.read_text())
+        self.assertEqual(data["project"], test_id)
+        self.assertNotIn("projects", data)
+        self.assertEqual(
+            [f["file"] for f in data["files"]],
+            ["lib/include/covlib.h", "lib/src/covlib.c", "lib/src/util/extra.c"])
+        for key in ("lines", "functions", "branches"):
+            for field in ("count", "covered"):
+                self.assertEqual(
+                    data[key][field],
+                    sum(f[key][field] for f in data["files"]))
+
+        self.bake(
+            [local_env, "run", "test", "--coverage", "--coverage-root", "lib",
+             "--", "--json", str(report)],
+            cwd=root)
+        data = json.loads(coverage.read_text())
+        self.assertEqual(
+            [f["file"] for f in data["files"]],
+            ["include/covlib.h", "src/covlib.c", "src/util/extra.c"])
+
+        self.bake(
+            [local_env, "run", "test", "--coverage", "--coverage-root",
+             str(root / "lib" / "src"), "--", "--json", str(report)],
+            cwd=root)
+        data = json.loads(coverage.read_text())
+        files = [f["file"] for f in data["files"]]
+        self.assertEqual(files[1:], ["covlib.c", "util/extra.c"])
+        self.assertTrue(Path(files[0]).is_absolute())
+        self.assertTrue(files[0].endswith("/lib/include/covlib.h"))
+
+        output = self.strip_ansi(self.bake_expect_failure(
+            [local_env, "run", "test", "--coverage", "--coverage-root", "missing",
+             "--", "--json", str(report)],
+            cwd=root))
+        self.assertIn("coverage root", output)
+        self.assertIn("is not a directory", output)
+
+    def test_coverage_report_filters_files_by_prefix_and_glob(self) -> None:
+        self.require_coverage_compiler()
+        root, test_id = self.write_coverage_workspace("coverage_filter")
+        local_env = "--local-env=coverage"
+        report = root / "report.json"
+        coverage = root / "report.coverage.json"
+
+        def run(*options: str) -> dict:
+            self.bake(
+                [local_env, "run", "test", "--coverage", *options,
+                 "--", "--json", str(report)],
+                cwd=root)
+            return json.loads(coverage.read_text())
+
+        full = run()
+        by_file = {f["file"]: f for f in full["files"]}
+
+        data = run("--coverage-include", "lib/src")
+        self.assertEqual(
+            [f["file"] for f in data["files"]],
+            ["lib/src/covlib.c", "lib/src/util/extra.c"])
+        for key in ("lines", "functions", "branches"):
+            for field in ("count", "covered"):
+                self.assertEqual(
+                    data[key][field],
+                    by_file["lib/src/covlib.c"][key][field] +
+                    by_file["lib/src/util/extra.c"][key][field])
+        self.assertEqual(data["lines"]["count"], 12)
+        self.assertEqual(data["lines"]["covered"], 9)
+        self.assertEqual(data["lines"]["percent"], 75.0)
+
+        data = run("--coverage-root", "lib", "--coverage-include", "src/,include",
+                   "--coverage-exclude", "src/util")
+        self.assertEqual(
+            [f["file"] for f in data["files"]],
+            ["include/covlib.h", "src/covlib.c"])
+
+        data = run("--coverage-include", "**/*.h,lib/src/*/*.c")
+        self.assertEqual(
+            [f["file"] for f in data["files"]],
+            ["lib/include/covlib.h", "lib/src/util/extra.c"])
+
+        data = run("--coverage-exclude", "lib/src/*.c")
+        self.assertEqual(
+            [f["file"] for f in data["files"]],
+            ["lib/include/covlib.h", "lib/src/util/extra.c"])
+
+        output = self.strip_ansi(self.bake(
+            [local_env, "coverage-report", "--coverage-root", "lib",
+             "--coverage-include", "src", "--coverage-exclude", "src/util/*"],
+            cwd=root))
+        self.assertIn(f"coverage of 1 test project: {test_id}", output)
+        self.assertRegex(output, r"\n  src\s+66\.67%\s+6/9")
+        self.assertNotIn("util", output)
+        self.assertNotIn("include", output)
+        report_dir = root / ".bake" / "local_env" / "coverage" / "coverage_report"
+        combined = json.loads((report_dir / "coverage.json").read_text())
+        self.assertEqual(combined["projects"], [test_id])
+        self.assertEqual([f["file"] for f in combined["files"]], ["src/covlib.c"])
+        self.assertEqual(combined["lines"], by_file["lib/src/covlib.c"]["lines"])
+        index = (report_dir / "index.html").read_text()
+        self.assertIn('"files": [\n["src/covlib.c",[6,9],[1,2],', index)
+
+    def test_coverage_report_options_are_validated(self) -> None:
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["build", "test/projects/c/app_helloworld", "--coverage",
+             "--coverage-include", "src"]))
+        self.assertIn(
+            "--coverage-root, --coverage-include, --coverage-exclude and "
+            "--coverage-summary can only be used with the run, test and "
+            "coverage-report commands", output)
+
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["rebuild", "test/projects/c/app_helloworld", "--coverage-summary"]))
+        self.assertIn("can only be used with the run, test and", output)
+
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["run", "test/projects/c/app_helloworld", "--coverage-root", "."]))
+        self.assertIn("require --coverage for the run command", output)
+
+    def test_coverage_summary_leaves_out_uncovered_lists(self) -> None:
+        self.require_coverage_compiler()
+        root, test_id = self.write_coverage_workspace("coverage_summary")
+        local_env = "--local-env=coverage"
+        report = root / "report.json"
+        coverage = root / "report.coverage.json"
+
+        self.bake(
+            [local_env, "run", "test", "--coverage", "--", "--json", str(report)],
+            cwd=root)
+        full = json.loads(coverage.read_text())
+
+        output = self.bake(
+            [local_env, "run", "test", "--coverage", "--coverage-summary",
+             "--", "--json", str(report)],
+            cwd=root)
+        self.assertIn("coverage: 80.00% lines (12/15)", output)
+        data = json.loads(coverage.read_text())
+        self.assertEqual(data["project"], test_id)
+        self.assertEqual(
+            [f["file"] for f in data["files"]], [f["file"] for f in full["files"]])
+        for summary, detail in zip(data["files"], full["files"]):
+            self.assertEqual(
+                set(summary), {"file", "lines", "functions", "branches"})
+            for key in ("lines", "functions", "branches"):
+                self.assertEqual(summary[key], detail[key])
+        for key in ("lines", "functions", "branches"):
+            self.assertEqual(data[key], full[key])
+
+        self.bake(
+            [local_env, "coverage-report", "--coverage-summary"], cwd=root)
+        report_dir = root / ".bake" / "local_env" / "coverage" / "coverage_report"
+        combined = json.loads((report_dir / "coverage.json").read_text())
+        self.assertEqual(combined["projects"], [test_id])
+        for f in combined["files"]:
+            self.assertEqual(set(f), {"file", "lines", "functions", "branches"})
+        self.assertTrue((report_dir / "index.html").is_file())
+        self.assertTrue(list((report_dir / "files").glob("*.js")))
+
+    def test_coverage_uncovered_functions_are_demangled_and_deduplicated(self) -> None:
+        self.require_coverage_compiler()
+        cxx = shutil.which("c++")
+        version = subprocess.run(
+            [cxx, "--version"], text=True, capture_output=True, check=False
+        ) if cxx else None
+        if not version or "clang" not in (version.stdout or ""):
+            self.skipTest("coverage of C++ code requires clang++")
+
+        stamp = int(time.time() * 1_000_000)
+        lib_id = f"tmp_tests_cov_tpl_lib_{stamp}"
+        test_id = f"tmp.tests.cov_tpl.test.{stamp}"
+        root = self.repo_root / "test" / "tmp" / f"coverage_cpp_{stamp}"
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        (root / "lib" / "src").mkdir(parents=True)
+        (root / "lib" / "include").mkdir(parents=True)
+        (root / "test" / "src").mkdir(parents=True)
+        (root / "lib" / "project.json").write_text(json.dumps(
+            {"id": lib_id, "type": "package", "value": {"language": "c++"}}) + "\n")
+        (root / "lib" / "include" / f"{lib_id}.h").write_text(
+            "namespace tpl {\n"
+            "template <typename T>\n"
+            "struct box {\n"
+            "    T value;\n"
+            "    T get() const {\n"
+            "        return value;\n"
+            "    }\n"
+            "    T twice() const {\n"
+            "        return value * 2;\n"
+            "    }\n"
+            "};\n"
+            "int used(int x);\n"
+            "int unused(int x);\n"
+            "double maybe(bool call);\n"
+            "}\n"
+        )
+        (root / "lib" / "src" / "tpl.cpp").write_text(
+            f"#include <{lib_id}.h>\n"
+            "template struct tpl::box<int>;\n"
+            "template struct tpl::box<long>;\n"
+            "namespace tpl {\n"
+            "int used(int x) {\n"
+            "    box<int> b{x};\n"
+            "    return b.get();\n"
+            "}\n"
+            "int unused(int x) {\n"
+            "    return x + 1;\n"
+            "}\n"
+            "double maybe(bool call) {\n"
+            "    box<double> b{1.5};\n"
+            "    if (call) {\n"
+            "        return b.get();\n"
+            "    }\n"
+            "    return 0;\n"
+            "}\n"
+            "}\n"
+        )
+        (root / "test" / "project.json").write_text(json.dumps({
+            "id": test_id,
+            "type": "test",
+            "value": {"language": "c++", "use": [lib_id]},
+            "test": {"testsuites": [{"id": "Tpl", "testcases": ["used"]}]},
+        }) + "\n")
+        (root / "test" / "src" / "Tpl.cpp").write_text(
+            "#include <bake_test.h>\n"
+            f"#include <{lib_id}.h>\n"
+            "void Tpl_used(void) {\n"
+            "    test_int(tpl::used(3), 3);\n"
+            "    test_assert(tpl::maybe(false) == 0);\n"
+            "}\n"
+        )
+
+        local_env = "--local-env=coverage"
+        report = root / "report.json"
+        self.bake(
+            [local_env, "run", "test", "--coverage", "--coverage-root", "lib",
+             "--", "--json", str(report)],
+            cwd=root)
+        data = json.loads((root / "report.coverage.json").read_text())
+        files = {f["file"]: f for f in data["files"]}
+        header = files[f"include/{lib_id}.h"]
+        source = files["src/tpl.cpp"]
+
+        self.assertEqual(header["uncovered_lines"], [[8, 10]])
+        self.assertEqual(
+            header["uncovered_functions"], [{"name": "tpl::box::twice", "line": 8}])
+        self.assertEqual(
+            source["uncovered_functions"], [{"name": "tpl::unused", "line": 9}])
+        self.assertEqual(source["uncovered_lines"], [[9, 11], [15, 16]])
+
+        lcov = next(
+            (root / ".bake" / "local_env" / "coverage" / "build").glob(
+                "**/coverage/coverage.lcov")).read_text()
+        self.assertEqual(lcov.count("FN:8,"), 2)
+        self.assertEqual(lcov.count("FN:5,"), 4)
+        fnf = {}
+        current = None
+        for line in lcov.splitlines():
+            if line.startswith("SF:"):
+                current = Path(line[3:]).name
+            elif line.startswith("FNF:"):
+                fnf[current] = int(line[4:])
+        self.assertEqual(header["functions"]["count"], fnf[f"{lib_id}.h"])
+        self.assertEqual(source["functions"]["count"], fnf["tpl.cpp"])
+
+        self.bake([local_env, "coverage-report", "--coverage-root", "lib"], cwd=root)
+        report_dir = root / ".bake" / "local_env" / "coverage" / "coverage_report"
+        combined = json.loads((report_dir / "coverage.json").read_text())
+        merged = {f["file"]: f for f in combined["files"]}
+        self.assertEqual(
+            merged[f"include/{lib_id}.h"]["uncovered_functions"],
+            [{"name": "tpl::box::twice", "line": 8}])
+        self.assertEqual(
+            merged["src/tpl.cpp"]["uncovered_functions"],
+            [{"name": "tpl::unused", "line": 9}])
+        self.assertEqual(merged["src/tpl.cpp"]["functions"], source["functions"])
+        pages = "".join(p.read_text() for p in (report_dir / "files").glob("*.js"))
+        self.assertIn('"tpl::box::twice",8,0', pages)
+        self.assertNotIn("_ZN", pages)
 
     def test_coverage_requires_clang(self) -> None:
         if platform.system() == "Windows":
@@ -2633,7 +3258,7 @@ class BakeTests(unittest.TestCase):
                     "id": project_id,
                     "type": "application",
                     "bench": {
-                        "benchsuites": [{"id": "Alpha", "benchcases": ["hang"]}]
+                        "benchsuites": [{"id": "Alpha", "benchcases": ["hang", "after"]}]
                     },
                 },
                 indent=4,
@@ -2649,16 +3274,123 @@ class BakeTests(unittest.TestCase):
             "#define case_sleep(sec) sleep(sec)\n"
             "#endif\n"
             "void Alpha_hang(bench_t *b) { (void)b; case_sleep(300); }\n"
+            "void Alpha_after(bench_t *b) {\n"
+            "    int x = 0;\n"
+            "    while (bench_iter(b)) { x += 1; bench_keep(x); }\n"
+            "}\n"
         )
 
+        report = project_dir / "report.json"
         start = time.monotonic()
         output = self.strip_ansi(self.bake_expect_failure(
-            ["--local-env=bench_timeout", "run", ".", "--", "--timeout", "2"],
+            ["--local-env=bench_timeout", "run", ".", "--", "--timeout", "2",
+             "--time", "0.1", "--samples", "3", "--sample-time", "0.001",
+             "--json", str(report)],
             cwd=project_dir))
         elapsed = time.monotonic() - start
 
         self.assertIn("TIMEOUT Alpha.hang (exceeded 2 seconds)", output)
+        self.assertRegex(output, r"(?m)^Alpha\.after\s+\S+ ns/iter")
+        self.assertIn("FAILED Alpha.hang (timeout)", output)
         self.assertLess(elapsed, 60.0, f"bench run took {elapsed:.1f}s")
+
+        data = json.loads(report.read_text())
+        self.assertEqual([b["case"] for b in data["benchmarks"]], ["after"])
+        self.assertEqual(data["failed"], 1)
+        self.assertEqual(data["failures"][0]["case"], "hang")
+        self.assertEqual(data["failures"][0]["status"], "timeout")
+
+    def test_bench_harness_isolates_crashing_cases(self) -> None:
+        stamp = int(time.time() * 1_000_000)
+        project_id = f"tmp.bench.crash.{stamp}"
+        project_dir = self.repo_root / "test" / "tmp" / f"bench_crash_{stamp}"
+        self.addCleanup(shutil.rmtree, project_dir, ignore_errors=True)
+        self.bench_project_files(project_dir, project_id, ["add", "boom", "nosamples", "mul"])
+        with (project_dir / "src" / "Alpha.c").open("a") as f:
+            f.write(
+                "\n"
+                "#include <stdio.h>\n"
+                "void Alpha_boom(bench_t *b) {\n"
+                "    volatile int *ptr = NULL;\n"
+                "    (void)b;\n"
+                "    printf(\"about to crash\\n\");\n"
+                "    fflush(stdout);\n"
+                "    *ptr = 1;\n"
+                "}\n"
+                "\n"
+                "void Alpha_nosamples(bench_t *b) { (void)b; }\n"
+            )
+
+        report = project_dir / "report.json"
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["--local-env=bench_crash", "run", ".", "--",
+             "--time", "0.1", "--samples", "3", "--sample-time", "0.001",
+             "--json", str(report)],
+            cwd=project_dir))
+
+        self.assertIn("about to crash", output)
+        self.assertIn("CRASH Alpha.boom", output)
+        self.assertIn("ERROR Alpha.nosamples (exit code 1)", output)
+        self.assertRegex(output, r"(?m)^Alpha\.add\s+\S+ ns/iter")
+        self.assertRegex(output, r"(?m)^Alpha\.mul\s+\S+ ns/iter")
+        self.assertIn("2 benchmark(s) failed:", output)
+        self.assertIn("FAILED Alpha.boom (crash)", output)
+        self.assertIn("FAILED Alpha.nosamples (error)", output)
+        self.assertLess(output.index("Alpha.add "), output.index("CRASH Alpha.boom"))
+        self.assertLess(output.index("CRASH Alpha.boom"), output.index("Alpha.mul "))
+
+        data = json.loads(report.read_text())
+        self.assertEqual(data["isolation"], "process")
+        self.assertEqual(data["cases"], 2)
+        self.assertEqual(data["failed"], 2)
+        by_case = {b["case"]: b for b in data["benchmarks"]}
+        self.assertEqual(set(by_case), {"add", "mul"})
+        for case in by_case.values():
+            self.assertEqual(case["status"], "ok")
+            self.assertNotIn("sample_ns", case)
+        self.assertEqual(by_case["add"]["items_per_iter"], 2)
+        counters = {c["name"]: c for c in by_case["add"]["counters"]}
+        self.assertAlmostEqual(counters["adds"]["per_iter"], 1.0, places=3)
+
+        failures = {f["case"]: f for f in data["failures"]}
+        self.assertEqual(set(failures), {"boom", "nosamples"})
+        self.assertEqual(failures["boom"]["status"], "crash")
+        if platform.system() != "Windows":
+            self.assertIn(failures["boom"]["signal"], {signal.SIGSEGV, signal.SIGBUS})
+        self.assertEqual(failures["nosamples"]["status"], "error")
+        self.assertEqual(failures["nosamples"]["exit_code"], 1)
+
+        single = project_dir / "single.json"
+        self.bake_expect_failure(
+            ["--local-env=bench_crash", "run", ".", "--", "Alpha.boom",
+             "--time", "0.1", "--samples", "3", "--sample-time", "0.001",
+             "--json", str(single)],
+            cwd=project_dir)
+        data = json.loads(single.read_text())
+        self.assertEqual(data["benchmarks"], [])
+        self.assertEqual([f["case"] for f in data["failures"]], ["boom"])
+
+    def test_bench_harness_runs_in_process(self) -> None:
+        stamp = int(time.time() * 1_000_000)
+        project_id = f"tmp.bench.inproc.{stamp}"
+        project_dir = self.repo_root / "test" / "tmp" / f"bench_inproc_{stamp}"
+        self.addCleanup(shutil.rmtree, project_dir, ignore_errors=True)
+        self.bench_project_files(project_dir, project_id, ["add", "mul"])
+
+        report = project_dir / "report.json"
+        output = self.strip_ansi(self.bake(
+            ["--local-env=bench_inproc", "run", ".", "--", "--in-process",
+             "--time", "0.1", "--samples", "3", "--sample-time", "0.001",
+             "--json", str(report)],
+            cwd=project_dir))
+        self.assertIn("Alpha.add", output)
+        self.assertIn("Alpha.mul", output)
+
+        data = json.loads(report.read_text())
+        self.assertEqual(data["isolation"], "none")
+        self.assertEqual(data["failed"], 0)
+        self.assertEqual(data["failures"], [])
+        self.assertEqual({b["case"] for b in data["benchmarks"]}, {"add", "mul"})
 
     def test_bench_project_runs_cases_and_writes_json_report(self) -> None:
         stamp = int(time.time() * 1_000_000)
@@ -2699,7 +3431,7 @@ class BakeTests(unittest.TestCase):
             self.assertGreaterEqual(case["iterations"], 1)
             self.assertGreaterEqual(case["samples"], 1)
             self.assertLessEqual(case["samples"], 5)
-            self.assertEqual(len(case["sample_ns"]), case["samples"])
+            self.assertNotIn("sample_ns", case)
             self.assertEqual(
                 case["total_iterations"], case["iterations"] * case["samples"])
             self.assertLessEqual(case["min_ns"], case["median_ns"])
@@ -2714,7 +3446,7 @@ class BakeTests(unittest.TestCase):
             self.assertGreaterEqual(case["outliers"], 0)
             self.assertGreaterEqual(case["outliers_severe"], 0)
             self.assertGreater(case["time_sec"], 0.0)
-            self.assertGreater(min(case["sample_ns"]), 0.0)
+            self.assertGreater(case["min_ns"], 0.0)
 
         self.assertEqual(by_case["add"]["items_per_iter"], 2)
         self.assertGreater(by_case["add"]["items_per_sec"], 0.0)
@@ -3063,6 +3795,44 @@ class BakeTests(unittest.TestCase):
         self.assertEqual(workspace_loc["code"], project_loc["code"])
         self.assertEqual(workspace_loc["by_language"], project_loc["by_language"])
 
+    def test_build_json_reports_lines_of_code_per_file(self) -> None:
+        project_dir, app_id = self.write_build_json_app("build_json_loc_by_file")
+        (project_dir / "include" / "sub").mkdir(parents=True)
+        (project_dir / "include" / "helper.h").write_text(
+            "// helper api\n#ifndef HELPER_H\n#define HELPER_H\n\n"
+            "int helper(void);\n\n#endif\n")
+        (project_dir / "include" / "sub" / "detail.h").write_text(
+            "#define DETAIL 1\n")
+        report_path = project_dir / "build.json"
+
+        self.bake(["build", str(project_dir), "--build-json", str(report_path)])
+
+        report = json.loads(report_path.read_text())
+        self.assertTrue(report["ok"])
+
+        project_loc = report["totals"]["project"][app_id]["loc"]
+        by_file = project_loc["by_file"]
+        self.assertEqual(
+            sorted(by_file),
+            ["include/helper.h", "include/sub/detail.h", "src/helper.c", "src/main.c"])
+        self.assertEqual(
+            by_file["include/helper.h"],
+            {"language": "C/C++ Header", "code": 4, "comment": 1, "blank": 2})
+        self.assertEqual(
+            by_file["include/sub/detail.h"],
+            {"language": "C/C++ Header", "code": 1, "comment": 0, "blank": 0})
+        self.assertEqual(by_file["src/helper.c"]["language"], "C")
+        self.assertEqual(by_file["src/helper.c"]["code"], 1)
+
+        self.assertEqual(project_loc["files"], len(by_file))
+        for field in ("code", "comment", "blank"):
+            self.assertEqual(
+                project_loc[field], sum(entry[field] for entry in by_file.values()))
+        self.assertEqual(project_loc["by_language"]["C/C++ Header"]["files"], 2)
+        self.assertEqual(project_loc["by_language"]["C"]["files"], 2)
+
+        self.assertNotIn("by_file", report["totals"]["loc"])
+
     def test_build_json_reports_a_note_when_cloc_is_unavailable(self) -> None:
         project_dir, app_id = self.write_build_json_app("build_json_loc_missing")
         report_path = project_dir / "build.json"
@@ -3090,6 +3860,123 @@ class BakeTests(unittest.TestCase):
         self.assertEqual(len(loc_steps), 1)
         self.assertFalse(loc_steps[0]["ok"])
         self.assertEqual(loc_steps[0]["error"], "cloc not found")
+
+    def test_build_json_repeat_keeps_the_median_run(self) -> None:
+        project_dir, app_id = self.write_build_json_app("build_json_repeat")
+        report_path = project_dir / "reports" / "build.json"
+
+        output = self.strip_ansi(self.bake(
+            ["rebuild", str(project_dir), "--repeat", "3", "--warmup", "1",
+             "--build-json", str(report_path)]))
+        self.assertEqual(output.count("clean] "), 4)
+        self.assertIn("[ repeat] median of 3 runs", output)
+
+        report = json.loads(report_path.read_text())
+        self.assertTrue(report["ok"])
+        self.assertEqual(
+            sorted(p.name for p in report_path.parent.iterdir()), ["build.json"])
+
+        repeat = report["repeat"]
+        self.assertEqual(repeat["warmup"], 1)
+        self.assertEqual(repeat["count"], 3)
+        runs = repeat["runs"]
+        self.assertEqual([run["run"] for run in runs], [0, 1, 2, 3])
+        self.assertEqual(
+            [run["warmup"] for run in runs], [True, False, False, False])
+        for run in runs:
+            self.assertTrue(run["ok"])
+            self.assertEqual(run["exit_code"], 0)
+            self.assertGreater(run["total_sec"], 0.0)
+        for run in runs[1:]:
+            self.assertEqual(run["loc_sec"], 0)
+
+        measured = sorted(run["total_sec"] - run["loc_sec"] for run in runs[1:])
+        self.assertAlmostEqual(repeat["median_sec"], measured[1], places=6)
+        chosen = runs[repeat["chosen_run"]]
+        self.assertFalse(chosen["warmup"])
+        self.assertAlmostEqual(chosen["total_sec"], report["total_sec"], places=6)
+        self.assertAlmostEqual(
+            chosen["total_sec"] - chosen["loc_sec"], repeat["median_sec"], places=6)
+
+        steps = self.report_steps(report)
+        self.assertEqual([step for step in steps if step["kind"] == "loc"], [])
+        self.assertEqual(report["totals"]["kind"]["loc"], 0)
+        self.assertEqual(
+            sorted(step["name"] for step in steps if step["kind"] == "compile"),
+            ["src/helper.c", "src/main.c"])
+        self.assertEqual(report["totals"]["project"][app_id]["files"], 2)
+
+        if shutil.which("cloc"):
+            self.assertGreater(runs[0]["loc_sec"], 0.0)
+            project_loc = report["totals"]["project"][app_id]["loc"]
+            self.assertEqual(project_loc["files"], 2)
+            self.assertEqual(
+                sorted(project_loc["by_file"]), ["src/helper.c", "src/main.c"])
+            self.assertEqual(report["totals"]["loc"]["files"], 2)
+
+    def test_build_json_repeat_without_warmup_counts_loc_once(self) -> None:
+        project_dir, app_id = self.write_build_json_app("build_json_repeat_nowarm")
+        report_path = project_dir / "build.json"
+
+        self.bake(
+            ["build", str(project_dir), "--repeat", "2",
+             "--build-json", str(report_path)])
+
+        report = json.loads(report_path.read_text())
+        self.assertTrue(report["ok"])
+        repeat = report["repeat"]
+        self.assertEqual((repeat["warmup"], repeat["count"]), (0, 2))
+        runs = repeat["runs"]
+        self.assertEqual([run["warmup"] for run in runs], [False, False])
+        self.assertEqual(runs[1]["loc_sec"], 0)
+        self.assertIn(repeat["chosen_run"], (0, 1))
+        measured = sorted(run["total_sec"] - run["loc_sec"] for run in runs)
+        self.assertAlmostEqual(repeat["median_sec"], measured[0], places=6)
+        self.assertAlmostEqual(
+            report["total_sec"] - report["totals"]["kind"]["loc"],
+            repeat["median_sec"], places=6)
+        if shutil.which("cloc"):
+            self.assertGreater(runs[0]["loc_sec"], 0.0)
+            self.assertEqual(report["totals"]["project"][app_id]["loc"]["files"], 2)
+
+    def test_build_json_repeat_stops_at_a_failing_run(self) -> None:
+        project_dir, _ = self.write_simple_app_project(
+            "build_json_repeat_failure",
+            "int main(void) { this is not c }\n",
+        )
+        report_path = project_dir / "build.json"
+
+        self.bake_expect_failure(
+            ["rebuild", str(project_dir), "--repeat", "3", "--warmup", "1",
+             "--build-json", str(report_path)])
+
+        report = json.loads(report_path.read_text())
+        self.assertFalse(report["ok"])
+        self.assertIsNone(report["repeat"]["chosen_run"])
+        runs = report["repeat"]["runs"]
+        self.assertEqual(len(runs), 1)
+        self.assertFalse(runs[0]["ok"])
+        self.assertNotEqual(runs[0]["exit_code"], 0)
+        self.assertEqual(
+            sorted(p.name for p in project_dir.glob("build.json*")), ["build.json"])
+
+    def test_build_json_repeat_is_validated(self) -> None:
+        report_path = self.repo_root / "test" / "tmp" / "unused_repeat_report.json"
+
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["run", "test/projects/c/app_helloworld", "--repeat", "2",
+             "--build-json", str(report_path)]))
+        self.assertIn("--repeat and --warmup can only be used with", output)
+
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["build", "test/projects/c/app_helloworld", "--repeat", "2"]))
+        self.assertIn("--repeat and --warmup require --build-json", output)
+
+        output = self.strip_ansi(self.bake_expect_failure(
+            ["build", "test/projects/c/app_helloworld", "--repeat", "0",
+             "--build-json", str(report_path)]))
+        self.assertIn("invalid value for --repeat", output)
+        self.assertFalse(report_path.exists())
 
     def test_setup_local_reinstalls_executable_bake_binary(self) -> None:
         installed_bake = self.bake_home / f"bake3{EXE_SUFFIX}"

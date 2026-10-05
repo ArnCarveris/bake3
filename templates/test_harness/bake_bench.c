@@ -9,8 +9,12 @@
 #if defined(_WIN32)
 #include <windows.h>
 #else
+#include <fcntl.h>
+#include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -57,6 +61,22 @@ typedef struct bake_bench_result_t {
     bool improved;
 } bake_bench_result_t;
 
+typedef struct bake_bench_failure_t {
+    char *suite;
+    char *name;
+    const char *status;
+    int signal;
+    long long exit_code;
+    double time_sec;
+} bake_bench_failure_t;
+
+typedef struct bake_bench_exit_t {
+    bool timed_out;
+    bool crashed;
+    int signal;
+    long long exit_code;
+} bake_bench_exit_t;
+
 typedef struct bake_bench_baseline_t {
     char *suite;
     char *name;
@@ -72,10 +92,16 @@ static double g_threshold = BAKE_BENCH_DEFAULT_THRESHOLD;
 static int32_t g_samples = BAKE_BENCH_DEFAULT_SAMPLES;
 static double g_timeout = BAKE_BENCH_DEFAULT_TIMEOUT;
 static bool g_fail_on_regression = false;
+static bool g_in_process = false;
+static const char *g_child_path = NULL;
 
 static bake_bench_result_t *g_results = NULL;
 static int32_t g_result_count = 0;
 static int32_t g_result_cap = 0;
+
+static bake_bench_failure_t *g_failures = NULL;
+static int32_t g_failure_count = 0;
+static int32_t g_failure_cap = 0;
 
 static bake_bench_baseline_t *g_baseline = NULL;
 static int32_t g_baseline_count = 0;
@@ -707,14 +733,6 @@ static void bake_bench_write_counters(FILE *f, const bake_bench_result_t *r) {
         fprintf(f, ", \"total\": %.6f, \"per_iter\": %.6f}",
             r->counter_values[i], per_iter);
     }
-    fputs("],\n", f);
-}
-
-static void bake_bench_write_samples(FILE *f, const bake_bench_result_t *r) {
-    fputs("      \"sample_ns\": [", f);
-    for (int32_t i = 0; i < r->samples; i ++) {
-        fprintf(f, "%s%.6f", i ? ", " : "", r->sample_ns[i]);
-    }
     fputs("]\n", f);
 }
 
@@ -724,6 +742,7 @@ static void bake_bench_write_result(FILE *f, const bake_bench_result_t *r, bool 
     fputs("    {\n", f);
     fputs("      \"suite\": ", f); bake_bench_json_string(f, r->suite); fputs(",\n", f);
     fputs("      \"case\": ", f); bake_bench_json_string(f, r->name); fputs(",\n", f);
+    fputs("      \"status\": \"ok\",\n", f);
     fprintf(f, "      \"iterations\": %llu,\n", (unsigned long long)r->iterations);
     fprintf(f, "      \"samples\": %d,\n", r->samples);
     fprintf(f, "      \"total_iterations\": %llu,\n", (unsigned long long)r->total_iters);
@@ -751,8 +770,20 @@ static void bake_bench_write_result(FILE *f, const bake_bench_result_t *r, bool 
     }
     fprintf(f, "      \"time_sec\": %.6f,\n", r->time_sec);
     bake_bench_write_counters(f, r);
-    bake_bench_write_samples(f, r);
     fprintf(f, "    }%s\n", last ? "" : ",");
+}
+
+static void bake_bench_write_failure(FILE *f, const bake_bench_failure_t *r, bool last) {
+    fputs("    {\"suite\": ", f); bake_bench_json_string(f, r->suite);
+    fputs(", \"case\": ", f); bake_bench_json_string(f, r->name);
+    fputs(", \"status\": ", f); bake_bench_json_string(f, r->status);
+    if (r->signal) {
+        fprintf(f, ", \"signal\": %d", r->signal);
+    }
+    if (r->exit_code) {
+        fprintf(f, ", \"exit_code\": %lld", r->exit_code);
+    }
+    fprintf(f, ", \"time_sec\": %.6f}%s\n", r->time_sec, last ? "" : ",");
 }
 
 static int bake_bench_write_json(const char *bench_id, double elapsed) {
@@ -785,11 +816,20 @@ static int bake_bench_write_json(const char *bench_id, double elapsed) {
     fprintf(f, "  \"samples\": %d,\n", g_samples);
     fprintf(f, "  \"time_budget_sec\": %.6f,\n", g_time);
     fprintf(f, "  \"sample_target_sec\": %.6f,\n", g_sample_time);
+    fputs("  \"isolation\": ", f);
+    bake_bench_json_string(f, g_in_process ? "none" : "process");
+    fputs(",\n", f);
     fprintf(f, "  \"cases\": %d,\n", g_result_count);
+    fprintf(f, "  \"failed\": %d,\n", g_failure_count);
     fprintf(f, "  \"time_sec\": %.6f,\n", elapsed);
     fputs("  \"benchmarks\": [\n", f);
     for (int32_t i = 0; i < g_result_count; i ++) {
         bake_bench_write_result(f, &g_results[i], (i + 1) == g_result_count);
+    }
+    fputs("  ],\n", f);
+    fputs("  \"failures\": [\n", f);
+    for (int32_t i = 0; i < g_failure_count; i ++) {
+        bake_bench_write_failure(f, &g_failures[i], (i + 1) == g_failure_count);
     }
     fputs("  ]\n}\n", f);
     fclose(f);
@@ -843,9 +883,6 @@ static void bake_bench_timeout_fired(int sig) {
 }
 #endif
 
-/* A benchcase runs in the process that measures it, so the timeout cannot be a
- * thread: an extra thread changes what the case measures. It is a kernel timer
- * that writes its message and ends the run when it fires. */
 static void bake_bench_timeout_arm(const char *suite, const char *name) {
     if (g_timeout <= 0) {
         return;
@@ -892,46 +929,69 @@ static void bake_bench_timeout_disarm(void) {
 #endif
 }
 
-static int bake_bench_run_case(
+static double bake_bench_measure(
+    bake_bench_suite *suite,
+    bake_bench_case *benchcase,
+    bench_t *b)
+{
+    memset(b, 0, sizeof(*b));
+    b->phase = BAKE_BENCH_PHASE_INIT;
+    b->target_samples = g_samples;
+    b->sample_target_ns = g_sample_time * 1e9;
+    b->budget_ns = g_time * 1e9;
+    b->warmup_budget_ns = b->budget_ns * 0.25;
+    if (b->warmup_budget_ns > 1e8) {
+        b->warmup_budget_ns = 1e8;
+    }
+    if (b->warmup_budget_ns < (b->sample_target_ns * 3.0)) {
+        b->warmup_budget_ns = b->sample_target_ns * 3.0;
+    }
+
+    uint64_t start = bake_bench_now_ns();
+    if (suite->setup) {
+        suite->setup();
+    }
+    benchcase->function(b);
+    if (suite->teardown) {
+        suite->teardown();
+    }
+    return (double)(bake_bench_now_ns() - start) / 1e9;
+}
+
+static int bake_bench_check(
+    const char *suite,
+    const char *name,
+    const bench_t *b)
+{
+    if (b->out_of_memory) {
+        printf("%s.%s: out of memory while collecting samples\n", suite, name);
+        return -1;
+    }
+    if (!b->sample_count) {
+        printf("%s.%s: no samples collected (add a 'while (bench_iter(b))' loop)\n",
+            suite, name);
+        return -1;
+    }
+    return 0;
+}
+
+static void bake_bench_result_finish(bake_bench_result_t *result) {
+    bake_bench_stats(result->sample_ns, result->samples, &result->stats);
+    bake_bench_apply_baseline(result);
+    bake_bench_print_result(result);
+}
+
+static int bake_bench_run_case_in_process(
     bake_bench_suite *suite,
     bake_bench_case *benchcase)
 {
     bench_t b;
-    memset(&b, 0, sizeof(b));
-    b.phase = BAKE_BENCH_PHASE_INIT;
-    b.target_samples = g_samples;
-    b.sample_target_ns = g_sample_time * 1e9;
-    b.budget_ns = g_time * 1e9;
-    b.warmup_budget_ns = b.budget_ns * 0.25;
-    if (b.warmup_budget_ns > 1e8) {
-        b.warmup_budget_ns = 1e8;
-    }
-    if (b.warmup_budget_ns < (b.sample_target_ns * 3.0)) {
-        b.warmup_budget_ns = b.sample_target_ns * 3.0;
-    }
-
-    uint64_t start = bake_bench_now_ns();
     bake_bench_timeout_arm(suite->id, benchcase->id);
-    if (suite->setup) {
-        suite->setup();
-    }
-    benchcase->function(&b);
-    if (suite->teardown) {
-        suite->teardown();
-    }
+    double elapsed = bake_bench_measure(suite, benchcase, &b);
     bake_bench_timeout_disarm();
-    double elapsed = (double)(bake_bench_now_ns() - start) / 1e9;
 
-    int rc = 0;
-    if (b.out_of_memory) {
-        printf("%s.%s: out of memory while collecting samples\n",
-            suite->id, benchcase->id);
-        rc = -1;
-    } else if (!b.sample_count) {
-        printf("%s.%s: no samples collected (add a 'while (bench_iter(b))' loop)\n",
-            suite->id, benchcase->id);
-        rc = -1;
-    } else {
+    int rc = bake_bench_check(suite->id, benchcase->id, &b);
+    if (!rc) {
         bake_bench_result_t *result = bake_bench_result_append();
         if (!result) {
             rc = -1;
@@ -950,13 +1010,486 @@ static int bake_bench_run_case(
                 result->counter_values[i] = b.counters[i].value;
             }
             result->counter_count = b.counter_count;
-            bake_bench_stats(result->sample_ns, result->samples, &result->stats);
-            bake_bench_apply_baseline(result);
-            bake_bench_print_result(result);
+            bake_bench_result_finish(result);
         }
     }
 
     free(b.samples);
+    return rc;
+}
+
+static int bake_bench_result_write(
+    const char *path,
+    const bench_t *b,
+    double elapsed)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        printf("failed to write benchcase result '%s': %s\n", path, strerror(errno));
+        return -1;
+    }
+
+    fprintf(f, "iterations %llu\n", (unsigned long long)b->iters_per_sample);
+    fprintf(f, "total_iterations %llu\n", (unsigned long long)b->total_iters);
+    fprintf(f, "items %lld\n", (long long)b->items);
+    fprintf(f, "time_sec %.17g\n", elapsed);
+    for (int32_t i = 0; i < b->counter_count; i ++) {
+        fprintf(f, "counter %.17g ", b->counters[i].value);
+        for (const char *p = b->counters[i].name; *p; p ++) {
+            fputc((*p == '\n' || *p == '\r') ? ' ' : *p, f);
+        }
+        fputc('\n', f);
+    }
+    for (int32_t i = 0; i < b->sample_count; i ++) {
+        fprintf(f, "sample %.17g\n", b->samples[i]);
+    }
+    fputs("end\n", f);
+
+    int rc = ferror(f) ? -1 : 0;
+    if (fclose(f) != 0) {
+        rc = -1;
+    }
+    return rc;
+}
+
+static int bake_bench_result_read(const char *path, bake_bench_result_t *result) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return -1;
+    }
+
+    char line[1024];
+    int32_t capacity = 0;
+    bool complete = false;
+    bool ok = true;
+
+    while (ok && fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[-- len] = '\0';
+        }
+
+        if (!strncmp(line, "sample ", 7)) {
+            if (result->samples == capacity) {
+                capacity = capacity ? (capacity * 2) : 64;
+                double *tmp = (double*)realloc(
+                    result->sample_ns, (size_t)capacity * sizeof(double));
+                if (!tmp) {
+                    ok = false;
+                    break;
+                }
+                result->sample_ns = tmp;
+            }
+            result->sample_ns[result->samples ++] = strtod(line + 7, NULL);
+        } else if (!strncmp(line, "counter ", 8)) {
+            char *name = NULL;
+            double value = strtod(line + 8, &name);
+            if (name && *name == ' ') {
+                name ++;
+            }
+            if (result->counter_count < BAKE_BENCH_MAX_COUNTERS) {
+                result->counter_names[result->counter_count] =
+                    bake_bench_strdup(name ? name : "");
+                result->counter_values[result->counter_count] = value;
+                result->counter_count ++;
+            }
+        } else if (!strncmp(line, "iterations ", 11)) {
+            result->iterations = strtoull(line + 11, NULL, 10);
+        } else if (!strncmp(line, "total_iterations ", 17)) {
+            result->total_iters = strtoull(line + 17, NULL, 10);
+        } else if (!strncmp(line, "items ", 6)) {
+            result->items = strtoll(line + 6, NULL, 10);
+        } else if (!strncmp(line, "time_sec ", 9)) {
+            result->time_sec = strtod(line + 9, NULL);
+        } else if (!strcmp(line, "end")) {
+            complete = true;
+        }
+    }
+
+    fclose(f);
+    return (ok && complete && result->samples > 0) ? 0 : -1;
+}
+
+static int bake_bench_run_child(
+    bake_bench_suite *suite,
+    bake_bench_case *benchcase)
+{
+    bench_t b;
+    double elapsed = bake_bench_measure(suite, benchcase, &b);
+    int rc = bake_bench_check(suite->id, benchcase->id, &b);
+    if (!rc) {
+        rc = bake_bench_result_write(g_child_path, &b, elapsed);
+    }
+    free(b.samples);
+    fflush(stdout);
+    return rc;
+}
+
+static char* bake_bench_temp_path(void) {
+#if defined(_WIN32)
+    char dir[MAX_PATH];
+    char path[MAX_PATH];
+    DWORD len = GetTempPathA(MAX_PATH, dir);
+    if (!len || len >= MAX_PATH) {
+        return NULL;
+    }
+    if (!GetTempFileNameA(dir, "bkb", 0, path)) {
+        return NULL;
+    }
+    return bake_bench_strdup(path);
+#else
+    const char *dir = getenv("TMPDIR");
+    if (!dir || !dir[0]) {
+        dir = "/tmp";
+    }
+    size_t dir_len = strlen(dir);
+    while (dir_len > 1 && dir[dir_len - 1] == '/') {
+        dir_len --;
+    }
+    size_t size = dir_len + 32;
+    char *path = (char*)malloc(size);
+    if (!path) {
+        return NULL;
+    }
+    snprintf(path, size, "%.*s/bake_bench_XXXXXX", (int)dir_len, dir);
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        free(path);
+        return NULL;
+    }
+    close(fd);
+    return path;
+#endif
+}
+
+static void bake_bench_temp_remove(const char *path) {
+#if defined(_WIN32)
+    DeleteFileA(path);
+#else
+    unlink(path);
+#endif
+}
+
+#if defined(_WIN32)
+static void bake_bench_cmdline_append(char *buf, size_t size, const char *arg) {
+    size_t len = strlen(buf);
+    if (len && (len + 1) < size) {
+        buf[len ++] = ' ';
+        buf[len] = '\0';
+    }
+    if ((len + 1) < size) {
+        buf[len ++] = '"';
+    }
+    for (const char *p = arg; *p && (len + 2) < size; p ++) {
+        if (*p == '"') {
+            buf[len ++] = '\\';
+        }
+        buf[len ++] = *p;
+    }
+    if ((len + 1) < size) {
+        buf[len ++] = '"';
+    }
+    buf[len < size ? len : (size - 1)] = '\0';
+}
+
+static int bake_bench_spawn(
+    char *const argv[],
+    double timeout,
+    bake_bench_exit_t *out)
+{
+    char cmd[8192] = {0};
+    for (int i = 0; argv[i]; i ++) {
+        bake_bench_cmdline_append(cmd, sizeof(cmd), argv[i]);
+    }
+
+    fflush(stdout);
+    fflush(stderr);
+
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    memset(&pi, 0, sizeof(pi));
+    si.cb = sizeof(si);
+
+    HANDLE job = CreateJobObjectA(NULL, NULL);
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, CREATE_SUSPENDED,
+        NULL, NULL, &si, &pi))
+    {
+        if (job) {
+            CloseHandle(job);
+        }
+        return -1;
+    }
+
+    if (job) {
+        AssignProcessToJobObject(job, pi.hProcess);
+    }
+    ResumeThread(pi.hThread);
+
+    DWORD wait_ms = INFINITE;
+    if (timeout > 0) {
+        double ms = timeout * 1000.0;
+        wait_ms = (ms >= (double)INFINITE) ? (INFINITE - 1) : (DWORD)ms;
+    }
+
+    DWORD wait_rc = WaitForSingleObject(pi.hProcess, wait_ms);
+    if (wait_rc == WAIT_TIMEOUT) {
+        out->timed_out = true;
+        if (job) {
+            TerminateJobObject(job, 1);
+        } else {
+            TerminateProcess(pi.hProcess, 1);
+        }
+        WaitForSingleObject(pi.hProcess, INFINITE);
+    }
+
+    DWORD exit_code = 0;
+    BOOL have_code = GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    if (job) {
+        CloseHandle(job);
+    }
+
+    if (out->timed_out) {
+        return 0;
+    }
+    if (!have_code) {
+        return -1;
+    }
+
+    out->exit_code = (long long)exit_code;
+    if (exit_code >= 0xC0000000u) {
+        out->crashed = true;
+    }
+    return 0;
+}
+#else
+static int bake_bench_spawn(
+    char *const argv[],
+    double timeout,
+    bake_bench_exit_t *out)
+{
+    fflush(stdout);
+    fflush(stderr);
+
+    int wait_pipe[2];
+    if (pipe(wait_pipe) != 0) {
+        return -1;
+    }
+    fcntl(wait_pipe[0], F_SETFD, FD_CLOEXEC);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(wait_pipe[0]);
+        close(wait_pipe[1]);
+        return -1;
+    }
+
+    if (pid == 0) {
+        close(wait_pipe[0]);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+
+    close(wait_pipe[1]);
+
+    uint64_t start = bake_bench_now_ns();
+    for (;;) {
+        int wait_ms = -1;
+        if (timeout > 0) {
+            double remaining = timeout -
+                ((double)(bake_bench_now_ns() - start) / 1e9);
+            if (remaining <= 0) {
+                out->timed_out = true;
+                kill(pid, SIGKILL);
+                break;
+            }
+            double ms = remaining * 1000.0 + 1.0;
+            wait_ms = ms > (double)INT_MAX ? INT_MAX : (int)ms;
+        }
+
+        struct pollfd pfd = { .fd = wait_pipe[0], .events = POLLIN, .revents = 0 };
+        int poll_rc = poll(&pfd, 1, wait_ms);
+        if (poll_rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (!poll_rc) {
+            continue;
+        }
+
+        char buf[64];
+        ssize_t count = read(wait_pipe[0], buf, sizeof(buf));
+        if (count > 0) {
+            continue;
+        }
+        if (count < 0 && (errno == EINTR || errno == EAGAIN)) {
+            continue;
+        }
+        break;
+    }
+    close(wait_pipe[0]);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            return -1;
+        }
+    }
+
+    if (out->timed_out) {
+        return 0;
+    }
+    if (WIFSIGNALED(status)) {
+        out->crashed = true;
+        out->signal = WTERMSIG(status);
+    } else if (WIFEXITED(status)) {
+        out->exit_code = WEXITSTATUS(status);
+    } else {
+        out->crashed = true;
+    }
+    return 0;
+}
+#endif
+
+static void bake_bench_failure_add(
+    const char *suite,
+    const char *name,
+    const char *status,
+    const bake_bench_exit_t *exit_info,
+    double time_sec)
+{
+    if (g_failure_count == g_failure_cap) {
+        int32_t cap = g_failure_cap ? (g_failure_cap * 2) : 8;
+        bake_bench_failure_t *tmp = (bake_bench_failure_t*)realloc(
+            g_failures, (size_t)cap * sizeof(bake_bench_failure_t));
+        if (!tmp) {
+            return;
+        }
+        g_failures = tmp;
+        g_failure_cap = cap;
+    }
+
+    bake_bench_failure_t *failure = &g_failures[g_failure_count ++];
+    memset(failure, 0, sizeof(*failure));
+    failure->suite = bake_bench_strdup(suite);
+    failure->name = bake_bench_strdup(name);
+    failure->status = status;
+    failure->time_sec = time_sec;
+    if (exit_info) {
+        failure->signal = exit_info->signal;
+        failure->exit_code = exit_info->exit_code;
+    }
+}
+
+static void bake_bench_failures_fini(void) {
+    for (int32_t i = 0; i < g_failure_count; i ++) {
+        free(g_failures[i].suite);
+        free(g_failures[i].name);
+    }
+    free(g_failures);
+    g_failures = NULL;
+    g_failure_count = 0;
+    g_failure_cap = 0;
+}
+
+static void bake_bench_print_crash(
+    const char *suite,
+    const char *name,
+    const bake_bench_exit_t *exit_info)
+{
+#if defined(_WIN32)
+    printf("CRASH %s.%s (exit code 0x%08llX)\n", suite, name,
+        (unsigned long long)exit_info->exit_code);
+#else
+    if (exit_info->signal) {
+        const char *desc = strsignal(exit_info->signal);
+        printf("CRASH %s.%s (signal %d: %s)\n", suite, name,
+            exit_info->signal, desc ? desc : "unknown");
+    } else {
+        printf("CRASH %s.%s\n", suite, name);
+    }
+#endif
+}
+
+static int bake_bench_run_case_isolated(
+    const char *exec,
+    bake_bench_suite *suite,
+    bake_bench_case *benchcase)
+{
+    char label[512];
+    char time_str[64];
+    char samples_str[32];
+    char sample_time_str[64];
+    snprintf(label, sizeof(label), "%s.%s", suite->id, benchcase->id);
+    snprintf(time_str, sizeof(time_str), "%.17g", g_time);
+    snprintf(samples_str, sizeof(samples_str), "%d", g_samples);
+    snprintf(sample_time_str, sizeof(sample_time_str), "%.17g", g_sample_time);
+
+    char *result_path = bake_bench_temp_path();
+    if (!result_path) {
+        printf("ERROR %s (failed to create temporary result file)\n", label);
+        bake_bench_failure_add(suite->id, benchcase->id, "error", NULL, 0.0);
+        return -1;
+    }
+
+    char *argv[] = {
+        (char*)exec, label,
+        (char*)"--bench-child", result_path,
+        (char*)"--time", time_str,
+        (char*)"--samples", samples_str,
+        (char*)"--sample-time", sample_time_str,
+        NULL
+    };
+
+    bake_bench_exit_t exit_info;
+    memset(&exit_info, 0, sizeof(exit_info));
+    uint64_t start = bake_bench_now_ns();
+    int spawn_rc = bake_bench_spawn(argv, g_timeout, &exit_info);
+    double elapsed = (double)(bake_bench_now_ns() - start) / 1e9;
+
+    int rc = -1;
+    if (spawn_rc != 0) {
+        printf("ERROR %s (failed to start benchcase process)\n", label);
+        bake_bench_failure_add(suite->id, benchcase->id, "error", NULL, elapsed);
+    } else if (exit_info.timed_out) {
+        printf("TIMEOUT %s (exceeded %g seconds)\n", label, g_timeout);
+        bake_bench_failure_add(
+            suite->id, benchcase->id, "timeout", &exit_info, elapsed);
+    } else if (exit_info.crashed) {
+        bake_bench_print_crash(suite->id, benchcase->id, &exit_info);
+        bake_bench_failure_add(
+            suite->id, benchcase->id, "crash", &exit_info, elapsed);
+    } else if (exit_info.exit_code != 0) {
+        printf("ERROR %s (exit code %lld)\n", label, exit_info.exit_code);
+        bake_bench_failure_add(
+            suite->id, benchcase->id, "error", &exit_info, elapsed);
+    } else {
+        bake_bench_result_t *result = bake_bench_result_append();
+        if (result) {
+            if (bake_bench_result_read(result_path, result) == 0) {
+                result->suite = bake_bench_strdup(suite->id);
+                result->name = bake_bench_strdup(benchcase->id);
+                bake_bench_result_finish(result);
+                rc = 0;
+            } else {
+                bake_bench_result_fini(result);
+                g_result_count --;
+            }
+        }
+        if (rc) {
+            printf("ERROR %s (benchcase process did not report a result)\n", label);
+            bake_bench_failure_add(
+                suite->id, benchcase->id, "error", &exit_info, elapsed);
+        }
+    }
+
+    fflush(stdout);
+    bake_bench_temp_remove(result_path);
+    free(result_path);
     return rc;
 }
 
@@ -998,6 +1531,14 @@ static int bake_bench_print_summary(const char *bench_id, double elapsed) {
     printf("-----------------------------\n");
     printf("%s: %d benchmark(s) in %.3fs\n", bench_id, g_result_count, elapsed);
 
+    if (g_failure_count) {
+        printf("%d benchmark(s) failed:\n", g_failure_count);
+        for (int32_t i = 0; i < g_failure_count; i ++) {
+            printf("FAILED %s.%s (%s)\n",
+                g_failures[i].suite, g_failures[i].name, g_failures[i].status);
+        }
+    }
+
     if (g_baseline_path) {
         printf("baseline %s: %d regression(s), %d improvement(s) beyond %.1f%%\n",
             g_baseline_path, regressions, improvements, g_threshold * 100.0);
@@ -1022,7 +1563,7 @@ static int bake_bench_parse_args(int argc, char *argv[], const char **single, co
             !strcmp(arg, "--filter") || !strcmp(arg, "--time") ||
             !strcmp(arg, "--sample-time") || !strcmp(arg, "--samples") ||
             !strcmp(arg, "--threshold") || !strcmp(arg, "--timeout") ||
-            !strcmp(arg, "-j"))
+            !strcmp(arg, "--bench-child") || !strcmp(arg, "-j"))
         {
             if (!value) {
                 printf("missing value for %s\n", arg);
@@ -1045,6 +1586,8 @@ static int bake_bench_parse_args(int argc, char *argv[], const char **single, co
                 g_threshold = atof(value);
             } else if (!strcmp(arg, "--timeout")) {
                 g_timeout = atof(value);
+            } else if (!strcmp(arg, "--bench-child")) {
+                g_child_path = value;
             }
 
             i ++;
@@ -1053,6 +1596,11 @@ static int bake_bench_parse_args(int argc, char *argv[], const char **single, co
 
         if (!strcmp(arg, "--fail-on-regression")) {
             g_fail_on_regression = true;
+            continue;
+        }
+
+        if (!strcmp(arg, "--in-process")) {
+            g_in_process = true;
             continue;
         }
 
@@ -1087,6 +1635,32 @@ static int bake_bench_parse_args(int argc, char *argv[], const char **single, co
     return 0;
 }
 
+static int bake_bench_child_main(
+    bake_bench_suite *suites,
+    uint32_t suite_count,
+    const char *single)
+{
+    if (!single) {
+        printf("--bench-child requires a <Suite>.<case> argument\n");
+        return 2;
+    }
+
+    for (uint32_t s = 0; s < suite_count; s ++) {
+        bake_bench_suite *suite = &suites[s];
+        for (uint32_t c = 0; c < suite->benchcase_count; c ++) {
+            char label[512];
+            snprintf(label, sizeof(label), "%s.%s",
+                suite->id, suite->benchcases[c].id);
+            if (!strcmp(label, single)) {
+                return bake_bench_run_child(suite, &suite->benchcases[c]) ? 1 : 0;
+            }
+        }
+    }
+
+    printf("benchcase '%s' not found\n", single);
+    return 2;
+}
+
 int bake_bench_run(
     const char *bench_id,
     int argc,
@@ -1115,6 +1689,10 @@ int bake_bench_run(
         return -1;
     }
 
+    if (g_child_path) {
+        return bake_bench_child_main(suites, suite_count, single);
+    }
+
     if (suite_filter && !bake_bench_find_suite(suites, suite_count, suite_filter)) {
         printf("bench suite '%s' not found\n", suite_filter);
         return -1;
@@ -1125,6 +1703,7 @@ int bake_bench_run(
     }
 
     int rc = 0;
+    int32_t selected = 0;
     uint64_t start = bake_bench_now_ns();
 
     for (uint32_t s = 0; s < suite_count; s ++) {
@@ -1136,7 +1715,11 @@ int bake_bench_run(
             {
                 continue;
             }
-            if (bake_bench_run_case(suite, benchcase) != 0) {
+            selected ++;
+            int case_rc = g_in_process ?
+                bake_bench_run_case_in_process(suite, benchcase) :
+                bake_bench_run_case_isolated(argv[0], suite, benchcase);
+            if (case_rc != 0) {
                 rc = -1;
             }
         }
@@ -1144,7 +1727,7 @@ int bake_bench_run(
 
     double elapsed = (double)(bake_bench_now_ns() - start) / 1e9;
 
-    if (!g_result_count) {
+    if (!selected) {
         printf("no benchmarks matched\n");
         rc = -1;
     }
@@ -1160,6 +1743,7 @@ int bake_bench_run(
     }
 
     bake_bench_results_fini();
+    bake_bench_failures_fini();
     bake_bench_baseline_fini();
 
     return rc;

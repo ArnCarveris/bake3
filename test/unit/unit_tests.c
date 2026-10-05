@@ -748,6 +748,49 @@ static void test_ps_shorten_path(void) {
     }
 }
 
+static void test_coverage_path_matches(void) {
+    CHECK(bake_coverage_path_matches("src", "src/a.c"));
+    CHECK(bake_coverage_path_matches("src/", "src/a/b.c"));
+    CHECK(bake_coverage_path_matches("./src", "src/a.c"));
+    CHECK(bake_coverage_path_matches("src/a.c", "src/a.c"));
+    CHECK(!bake_coverage_path_matches("src", "srcx/a.c"));
+    CHECK(!bake_coverage_path_matches("src", "include/src/a.c"));
+    CHECK(!bake_coverage_path_matches("", "src/a.c"));
+
+    CHECK(bake_coverage_path_matches("src/*.c", "src/a.c"));
+    CHECK(!bake_coverage_path_matches("src/*.c", "src/sub/a.c"));
+    CHECK(bake_coverage_path_matches("src/**", "src/sub/a.c"));
+    CHECK(bake_coverage_path_matches("src/**/*.c", "src/a.c"));
+    CHECK(bake_coverage_path_matches("src/**/*.c", "src/x/y/a.c"));
+    CHECK(!bake_coverage_path_matches("src/**/*.c", "src/x/a.h"));
+    CHECK(bake_coverage_path_matches("**/*.h", "include/a/b.h"));
+    CHECK(bake_coverage_path_matches("*/lib?.c", "src/lib1.c"));
+    CHECK(!bake_coverage_path_matches("*/lib?.c", "src/lib12.c"));
+    CHECK(!bake_coverage_path_matches("*.c", "src/a.c"));
+}
+
+static void test_coverage_simplify_name(void) {
+    const char *cases[][3] = {
+        {"flecs::world::get_ref<Position>", "0", "flecs::world::get_ref"},
+        {"flecs::box<flecs::pair<int, char>>::get", "0", "flecs::box::get"},
+        {"ns::operator<<", "0", "ns::operator<<"},
+        {"ns::type<int>::operator<", "0", "ns::type::operator<"},
+        {"ns::type<int>::operator()", "0", "ns::type::operator()"},
+        {"ns::type<int>::operator->", "0", "ns::type::operator->"},
+        {"cooperator<int>::run", "0", "cooperator::run"},
+        {"(anonymous namespace)::helper<int>", "0", "(anonymous namespace)::helper"},
+        {"covlib_unused", "0", "covlib_unused"},
+        {"ns::f<int>(int, char) const", "1", "ns::f"},
+        {"ns::type<int>::operator()(int)", "1", "ns::type::operator()"},
+        {"(anonymous namespace)::g(int)", "1", "(anonymous namespace)::g"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char *result = bake_coverage_simplify_name(cases[i][0], cases[i][1][0] == '1');
+        CHECK_STR(result, cases[i][2]);
+        ecs_os_free(result);
+    }
+}
+
 int main(void) {
     ecs_os_init();
 
@@ -775,6 +818,8 @@ int main(void) {
     test_ps_kill_target_matching();
     test_ps_registry_roundtrip();
     test_ps_shorten_path();
+    test_coverage_path_matches();
+    test_coverage_simplify_name();
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;

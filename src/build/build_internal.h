@@ -66,6 +66,7 @@ int32_t bake_em_serve_first_port(int32_t requested);
 bake_compiler_kind_t bake_detect_compiler_kind(const char *cc, const char *cxx);
 void bake_add_mode_flags(const char *mode, bake_compiler_kind_t kind, bake_strlist_t *cflags, bake_strlist_t *cxxflags, bake_strlist_t *ldflags);
 void bake_add_strict_flags(bool strict, bake_compiler_kind_t kind, bake_strlist_t *cflags, bake_strlist_t *cxxflags, bake_strlist_t *ldflags);
+char* bake_coverage_tool(const bake_context_t *ctx, const char *tool);
 void bake_add_coverage_flags(bool coverage, bake_strlist_t *cflags, bake_strlist_t *cxxflags, bake_strlist_t *ldflags);
 void bake_list_append_fmt(ecs_strbuf_t *buf, const bake_strlist_t *list, const char *prefix);
 char* bake_display_path(const char *full_path, const char *strip_prefix);
@@ -96,7 +97,20 @@ int bake_link_project_binary(
     bool *linked_out);
 
 int bake_amalgamate_project(const bake_project_cfg_t *cfg, const char *dst_dir);
-int bake_generate_project_amalgamation(const bake_project_cfg_t *cfg);
+int bake_generate_project_amalgamation(
+    const bake_project_cfg_t *cfg,
+    const char *prefix);
+char* bake_amalgamate_output_base(
+    const bake_project_cfg_t *cfg,
+    const bake_amalgamate_cfg_t *amalg);
+
+int bake_amalgamate_target_add(
+    bake_context_t *ctx,
+    const char *root,
+    char **target_out);
+int bake_amalgamate_target_stage(
+    bake_context_t *ctx,
+    bake_project_cfg_t *cfg);
 
 void bake_report_collect_loc(
     bake_context_t *ctx,

@@ -88,36 +88,22 @@ static char* bake_test_coverage_source(
 {
     char *content = bake_file_read(tmpl_src, NULL);
     char *dir = bake_coverage_dir(cfg, ctx->opts.mode);
-    char *build_root = bake_project_build_root(cfg->path, cfg->id, ctx->opts.mode);
-    char *project_dir = bake_path_resolve(cfg->path);
     char *result = NULL;
 
-    if (!content || !dir || !build_root || bake_os_mkdirs(dir) != 0) {
+    if (!content || !dir || bake_os_mkdirs(dir) != 0) {
         goto cleanup;
     }
 
     ecs_strbuf_t buf = ECS_STRBUF_INIT;
     ecs_strbuf_appendstr(&buf, "#define BAKE_TEST_COVERAGE_DIR ");
     bake_append_c_literal(&buf, dir);
-    ecs_strbuf_appendstr(&buf, "\n#define BAKE_TEST_COVERAGE_PROFDATA ");
-    bake_append_c_literal(&buf, ctx->coverage_profdata);
-    ecs_strbuf_appendstr(&buf, "\n#define BAKE_TEST_COVERAGE_COV ");
-    bake_append_c_literal(&buf, ctx->coverage_cov);
-    ecs_strbuf_appendstr(&buf, "\n#define BAKE_TEST_COVERAGE_EXCLUDE {");
-    bake_append_c_literal(&buf, cfg->path);
-    ecs_strbuf_appendstr(&buf, ", ");
-    bake_append_c_literal(&buf, project_dir ? project_dir : cfg->path);
-    ecs_strbuf_appendstr(&buf, ", ");
-    bake_append_c_literal(&buf, build_root);
-    ecs_strbuf_appendstr(&buf, ", NULL}\n");
+    ecs_strbuf_appendstr(&buf, "\n");
     ecs_strbuf_appendstr(&buf, content);
     result = ecs_strbuf_get(&buf);
 
 cleanup:
     ecs_os_free(content);
     ecs_os_free(dir);
-    ecs_os_free(build_root);
-    ecs_os_free(project_dir);
     return result;
 }
 
@@ -172,6 +158,41 @@ int bake_test_generate_builtin_api(
     return rc;
 }
 
+static char* bake_test_coverage_json_path(
+    const bake_context_t *ctx,
+    const bake_project_cfg_t *cfg,
+    char **test_json_out)
+{
+    const char *json = NULL;
+    for (int i = 0; i < ctx->opts.run_argc; i++) {
+        const char *arg = ctx->opts.run_argv[i];
+        bool has_value = !strcmp(arg, "--json") || !strcmp(arg, "-j") ||
+            !strcmp(arg, "--timeout") || !strcmp(arg, "--param");
+        if (!has_value || (i + 1) >= ctx->opts.run_argc) {
+            continue;
+        }
+        if (!strcmp(arg, "--json")) {
+            json = ctx->opts.run_argv[i + 1];
+        }
+        i++;
+    }
+    if (!json || !json[0]) {
+        return NULL;
+    }
+
+    char *run_dir = bake_project_run_dir(cfg);
+    char *test_json = bake_path_is_abs(json) || !run_dir
+        ? ecs_os_strdup(json)
+        : bake_path_join(run_dir, json);
+    ecs_os_free(run_dir);
+
+    size_t len = strlen(test_json);
+    size_t base_len = bake_has_suffix(test_json, ".json") ? len - 5 : len;
+    char *coverage_json = flecs_asprintf("%.*s.coverage.json", (int)base_len, test_json);
+    *test_json_out = test_json;
+    return coverage_json;
+}
+
 int bake_test_run_project(bake_context_t *ctx, const bake_project_cfg_t *cfg, const char *exe_path) {
     char *old_threads = NULL;
     const char *old_env = getenv("BAKE_TEST_THREADS");
@@ -189,6 +210,12 @@ int bake_test_run_project(bake_context_t *ctx, const bake_project_cfg_t *cfg, co
         ecs_os_free(old_threads);
         return -1;
     }
+
+    char *test_json = NULL;
+    char *coverage_json = ctx && ctx->opts.coverage
+        ? bake_test_coverage_json_path(ctx, cfg, &test_json)
+        : NULL;
+    int64_t test_json_mtime = test_json ? bake_os_file_mtime(test_json) : -1;
 
     ecs_strbuf_t cmd = ECS_STRBUF_INIT;
     if (ctx && ctx->opts.run_prefix) {
@@ -226,6 +253,17 @@ int bake_test_run_project(bake_context_t *ctx, const bake_project_cfg_t *cfg, co
     ecs_os_free(env_name);
     ecs_os_free(run_dir);
     ecs_os_free(cmd_str);
+
+    if (coverage_json) {
+        int64_t mtime = bake_os_file_mtime(test_json);
+        if (mtime >= 0 && mtime != test_json_mtime &&
+            bake_coverage_project_report(ctx, cfg, exe_path, coverage_json) != 0)
+        {
+            rc = -1;
+        }
+    }
+    ecs_os_free(test_json);
+    ecs_os_free(coverage_json);
 
     if (ctx && ctx->opts.jobs > 0) {
         if (old_threads) {

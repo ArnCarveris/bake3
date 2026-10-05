@@ -123,7 +123,8 @@ int bake_compose_compile_command_posix(const bake_compile_cmd_ctx_t *ctx, ecs_st
 
 int bake_compose_link_command_posix(const bake_link_cmd_ctx_t *ctx, ecs_strbuf_t *cmd) {
     bool is_lib = ctx->cfg->kind == BAKE_PROJECT_PACKAGE;
-    if (is_lib) {
+    bool is_shared = is_lib && ctx->cfg->shared_library;
+    if (is_lib && !is_shared) {
         const char *ar_prefix = bake_target_is_emscripten() ? "emar rcs " : "ar rcs ";
         bake_strbuf_append_quoted_path(cmd, ar_prefix, ctx->artefact);
         for (int32_t i = 0; i < ctx->units->count; i++) {
@@ -137,6 +138,18 @@ int bake_compose_link_command_posix(const bake_link_cmd_ctx_t *ctx, ecs_strbuf_t
         : (ctx->ctx->opts.cc ? ctx->ctx->opts.cc : "cc");
 
     ecs_strbuf_append(cmd, "%s", linker);
+    if (is_shared) {
+        char *file_name = bake_path_basename(ctx->artefact);
+        if (!strcmp(bake_target_os(), "Darwin")) {
+            ecs_strbuf_append(cmd,
+                " -dynamiclib -install_name \"@rpath/%s\"", file_name);
+        } else if (!strcmp(bake_target_os(), "Linux")) {
+            ecs_strbuf_append(cmd, " -shared -Wl,-soname,\"%s\"", file_name);
+        } else {
+            ecs_strbuf_appendstr(cmd, " -shared");
+        }
+        ecs_os_free(file_name);
+    }
     for (int32_t i = 0; i < ctx->units->count; i++) {
         bake_strbuf_append_quoted_path(cmd, " ", ctx->units->items[i].obj);
     }

@@ -92,7 +92,7 @@ void bake_build_paths_fini(bake_build_paths_t *paths) {
 int bake_build_paths_init(const bake_project_cfg_t *cfg, const char *mode, bake_build_paths_t *paths) {
     memset(paths, 0, sizeof(*paths));
 
-    paths->build_root = bake_project_build_root(cfg->path, cfg->id, mode);
+    paths->build_root = bake_project_cfg_build_root(cfg, mode);
     if (!paths->build_root) {
         ecs_err("bake_build_paths_init: failed to build build_root");
         return -1;

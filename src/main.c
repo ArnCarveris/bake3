@@ -58,6 +58,7 @@ int main(int argc, char *argv[]) {
         BFLAG("--standalone", standalone)
         BFLAG("--strict", strict)
         BFLAG("--coverage", coverage)
+        BFLAG("--coverage-summary", coverage_summary)
         BFLAG("--fix-lint", fix_lint)
         BFLAG("--trace", trace)
         BFLAG("--local", setup_local)
@@ -113,6 +114,26 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
+        if (!strcmp(arg, "--repeat") || !strcmp(arg, "--warmup")) {
+            if ((i + 1) >= argc) {
+                ecs_err("missing value for %s", arg);
+                goto cleanup;
+            }
+            bool is_repeat = !strcmp(arg, "--repeat");
+            char *end = NULL;
+            long count = strtol(argv[++i], &end, 10);
+            if (count < (is_repeat ? 1 : 0) || count > 10000 || !end || *end) {
+                ecs_err("invalid value for %s: %s", arg, argv[i]);
+                goto cleanup;
+            }
+            if (is_repeat) {
+                opts.repeat = (int32_t)count;
+            } else {
+                opts.warmup = (int32_t)count;
+            }
+            continue;
+        }
+
         if (!strcmp(arg, "--port")) {
             if ((i + 1) >= argc) {
                 ecs_err("missing value for --port");
@@ -144,6 +165,10 @@ int main(int argc, char *argv[]) {
         VARG("--run-prefix", run_prefix)
         VARG("--kill", ps_kill)
         VARG("--build-json", build_json)
+        VARG("--coverage-root", coverage_root)
+        VARG("--coverage-include", coverage_include)
+        VARG("--coverage-exclude", coverage_exclude)
+        VARG("--amalgamate", amalgamate)
 #undef VARG
 
         if (arg[0] == '-') {
@@ -193,26 +218,6 @@ int main(int argc, char *argv[]) {
         if (!opts.cxx) opts.cxx = "em++";
     }
 
-    if (opts.local_env) {
-        const char *existing_bake_home = getenv("BAKE_HOME");
-        if (existing_bake_home && existing_bake_home[0]) {
-            bake_os_setenv("BAKE_GLOBAL_HOME", existing_bake_home);
-        } else {
-            bake_os_unsetenv("BAKE_GLOBAL_HOME");
-        }
-
-        local_bake_home = bake_local_env_home(cwd, local_env_name);
-        if (!local_bake_home) {
-            ecs_err("failed to resolve local bake environment path");
-            goto cleanup;
-        }
-        bake_os_setenv("BAKE_HOME", local_bake_home);
-        bake_os_setenv("BAKE_LOCAL_ENV", "1");
-    } else {
-        bake_os_setenv("BAKE_LOCAL_ENV", "0");
-        bake_os_unsetenv("BAKE_GLOBAL_HOME");
-    }
-
     if (opts.setup_local && strcmp(opts.command, "setup")) {
         ecs_err("--local can only be used with the setup command");
         goto cleanup;
@@ -232,10 +237,85 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
 
+    if (opts.amalgamate) {
+        const char *cmd = opts.command ? opts.command : "build";
+        if (strcmp(cmd, "build") && strcmp(cmd, "rebuild") &&
+            strcmp(cmd, "clean"))
+        {
+            ecs_err("--amalgamate can only be used with the build, rebuild "
+                "and clean commands");
+            goto cleanup;
+        }
+        if (!bake_amalgamate_prefix_valid(opts.amalgamate)) {
+            ecs_err("invalid --amalgamate prefix '%s' (use letters, digits, "
+                "'.', '_' or '-')", opts.amalgamate);
+            goto cleanup;
+        }
+        if (bake_target_name_is_em(opts.toolchain)) {
+            ecs_err("--amalgamate builds a shared library, which is not "
+                "supported for the em target");
+            goto cleanup;
+        }
+    }
+
     if (opts.coverage && !bake_command_builds(opts.command)) {
         ecs_err("--coverage can only be used with the build, rebuild, run, "
             "test and bench commands");
         goto cleanup;
+    }
+
+    if (opts.coverage_root || opts.coverage_include || opts.coverage_exclude ||
+        opts.coverage_summary)
+    {
+        const char *cmd = opts.command ? opts.command : "build";
+        bool writes_report = !strcmp(cmd, "run") || !strcmp(cmd, "test");
+        if (!writes_report && strcmp(cmd, "coverage-report")) {
+            ecs_err("--coverage-root, --coverage-include, --coverage-exclude and "
+                "--coverage-summary can only be used with the run, test and "
+                "coverage-report commands");
+            goto cleanup;
+        }
+        if (writes_report && !opts.coverage) {
+            ecs_err("--coverage-root, --coverage-include, --coverage-exclude and "
+                "--coverage-summary require --coverage for the %s command", cmd);
+            goto cleanup;
+        }
+    }
+
+    bool repeat = opts.repeat > 0 || opts.warmup > 0;
+    if (repeat) {
+        const char *cmd = opts.command ? opts.command : "build";
+        if (strcmp(cmd, "build") && strcmp(cmd, "rebuild")) {
+            ecs_err("--repeat and --warmup can only be used with the build and "
+                "rebuild commands");
+            goto cleanup;
+        }
+        if (!opts.build_json) {
+            ecs_err("--repeat and --warmup require --build-json");
+            goto cleanup;
+        }
+        rc = bake_repeat_build(&opts, argc, argv) == 0 ? 0 : 1;
+        goto cleanup;
+    }
+
+    if (opts.local_env) {
+        const char *existing_bake_home = getenv("BAKE_HOME");
+        if (existing_bake_home && existing_bake_home[0]) {
+            bake_os_setenv("BAKE_GLOBAL_HOME", existing_bake_home);
+        } else {
+            bake_os_unsetenv("BAKE_GLOBAL_HOME");
+        }
+
+        local_bake_home = bake_local_env_home(cwd, local_env_name);
+        if (!local_bake_home) {
+            ecs_err("failed to resolve local bake environment path");
+            goto cleanup;
+        }
+        bake_os_setenv("BAKE_HOME", local_bake_home);
+        bake_os_setenv("BAKE_LOCAL_ENV", "1");
+    } else {
+        bake_os_setenv("BAKE_LOCAL_ENV", "0");
+        bake_os_unsetenv("BAKE_GLOBAL_HOME");
     }
 
     if (bake_context_init(&ctx, &opts) != 0) {

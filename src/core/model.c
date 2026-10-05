@@ -522,8 +522,9 @@ void bake_model_mark_build_targets(ecs_world_t *world, const char *target, const
         return;
     }
 
-    if (bake_path_exists(target)) {
-        bool target_is_dir = bake_path_is_dir(target);
+    bool target_exists = bake_path_exists(target);
+    if (target_exists || bake_path_is_abs(target)) {
+        bool target_is_dir = target_exists && bake_path_is_dir(target);
         ecs_entity_t exact = 0;
         ecs_iter_t all = ecs_each_id(world, ecs_id(BakeProject));
         while (ecs_each_next(&all)) {
@@ -592,7 +593,7 @@ static void bake_model_collect_resolved_deps(
             bake_model_try_append_include_path(cfg, bake_home, dep_project->external, resolved);
 
             if (!dep_project->external && cfg->path) {
-                char *lib = bake_project_build_root(cfg->path, cfg->id, mode);
+                char *lib = bake_project_cfg_build_root(cfg, mode);
                 if (lib && bake_path_exists(lib)) {
                     bake_strlist_append_unique(&resolved->build_libpaths, lib);
                 }

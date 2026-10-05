@@ -18,6 +18,10 @@ typedef struct bake_options_t {
     const char *run_prefix;
     const char *ps_kill;
     const char *build_json;
+    const char *coverage_root;
+    const char *coverage_include;
+    const char *coverage_exclude;
+    const char *amalgamate;
     bool json;
     bool all_users;
     bool ps_full;
@@ -25,12 +29,15 @@ typedef struct bake_options_t {
     bool standalone;
     bool strict;
     bool coverage;
+    bool coverage_summary;
     bool fix_lint;
     bool trace;
     bool setup_local;
     bool local_env;
     int32_t jobs;
     int32_t port;
+    int32_t repeat;
+    int32_t warmup;
     int run_argc;
     const char **run_argv;
 } bake_options_t;

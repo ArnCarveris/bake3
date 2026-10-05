@@ -117,11 +117,18 @@ Options:
   --full              ps only: print untruncated workspace and command columns
   --kill <pid|env>    ps only: stop a listed process, environment or env kind
   --build-json <file> Write a json report of the build with per step timings
+  --repeat <n>        Build/rebuild only: run the build n times, keep the median report
+  --warmup <n>        Build/rebuild only: unmeasured runs before --repeat runs
   --local-env[=<name>] Use ./.bake/local_env (or ./.bake/local_env/<name>) as isolated BAKE_HOME and build root
   --local             Setup only: install into BAKE_HOME (skip /usr/local/bin)
   --standalone        Use amalgamated dependency sources in deps/
   --strict            Enable strict compiler warnings and checks
+  --amalgamate <prefix> Build <prefix>.c/.h of the project as a shared library
   --coverage          Build with coverage instrumentation (clang only)
+  --coverage-root <dir> Make coverage report paths relative to dir (default: cwd)
+  --coverage-include <patterns> Only report files matching a comma separated prefix or glob
+  --coverage-exclude <patterns> Leave out files matching a comma separated prefix or glob
+  --coverage-summary  Leave uncovered lines and functions out of coverage json reports
   --fix-lint          Run the lint command of projects with the autofix action
   --trace             Enable trace logging (Flecs log level 0)
   -j <count>          Number of parallel jobs for build/test execution
@@ -304,6 +311,81 @@ The following options are supported:
 - `amalgamate-path`: Destination path for the output of the amalgamation process.
 - `output`: Name of the build artefact. Defaults to the project id.
 - `standalone`: When true, this will copy all amalgamated sources from dependencies to a `deps` folder in the project, and include those in the project build rather than relying on linking with dependency binaries. This allows for the project to be easily shared, without having to also share the dependencies. The sources in `deps` are refreshed automatically when a dependency changes. When the dependency sources are not available (for example on a machine that only has the standalone project), the existing sources in `deps` are used as is.
+
+## Building an amalgamation as a shared library
+`--amalgamate <prefix>` builds the amalgamated `<prefix>.c` and `<prefix>.h` of
+a project as a shared library. It is accepted by `build` (the default command),
+`rebuild` and `clean`, and works with the other build options such as `--cfg`,
+`--local-env`, `-j`, `--repeat`, `--coverage` and `--build-json`:
+
+```sh
+bake3 --amalgamate flecs_no_addons
+bake3 rebuild --amalgamate flecs --cfg release --build-json /tmp/flecs.json
+bake3 clean --amalgamate flecs_no_addons
+bake3 --amalgamate flecs_no_addons path/to/flecs --local-env=amalg
+```
+
+The target (the current directory by default) must be a project directory.
+Bake looks for the files in this order:
+
+1. The `amalgamate` configuration of the project that produces `<prefix>`: a
+   configuration with that `prefix`, or one without a prefix when `<prefix>`
+   is the name of the project's main header. The files are read from its `path`.
+2. `<prefix>.h` with `<prefix>.c` or `<prefix>.cpp` in the project root.
+
+When neither is found the build fails, and lists the prefixes the project's
+amalgamate configurations produce.
+
+When the files come from an amalgamate configuration, bake regenerates that one
+amalgamation before it builds the library, exactly like a build of the project
+does, so the library never contains stale code. Like a regular build, this only
+rewrites a file when its content changes. Files found in the project root are
+used as they are.
+
+The library is built by a private, generated project with the prefix as id. It
+goes through the same build path as any other project: it has its own build
+report entries (`totals.project.<prefix>`, the `src/<prefix>.c` compile step and
+lines of code), its own compile flags fingerprint and incremental rebuilds, and
+it is not installed into the bake environment. Only the library is built, not
+the project that produces the amalgamation. The generated project lives in the
+build directory of that project, never in the source tree:
+
+- `.bake/amalgamate/<prefix>` for the global environment
+- `.bake/local_env/build/<project-id>/amalgamate/<prefix>` for `--local-env`
+- `.bake/local_env/<name>/build/<project-id>/amalgamate/<prefix>` for
+  `--local-env=<name>`
+
+That directory holds a `project.json`, a copy of the amalgamated files in `src`
+and the build output in `<arch-os-config>`, for example
+`.bake/amalgamate/flecs_no_addons/arm64-Darwin-release/libflecs_no_addons.dylib`
+(`lib<prefix>.so` on Linux, `<prefix>.dll` on Windows). The output does not
+collide with the build of the project itself, even when the prefix is equal to
+the project id. `clean --amalgamate <prefix>` removes the directory, and
+cleaning the project also removes the amalgamation builds in it.
+
+The amalgamated file is compiled the way a user would compile it after dropping
+it into their own code base:
+
+- The defines, compiler flags and include paths of the project are not applied,
+  as they describe how the project builds its own sources. Its language and
+  language standard are kept, and so are its libraries, library paths and
+  linker flags, because a shared library has to link the system libraries the
+  code depends on (for example `ws2_32` or `pthread`).
+- Dependencies in `use` and `use-private` are resolved like for the project:
+  they are built first, their headers are on the include path and their
+  libraries are linked into the shared library. Bake builds dependencies as
+  regular static libraries without `-fPIC`, which Linux linkers may refuse to
+  put in a shared library.
+- Amalgamated headers generated by bake start with
+  `// Comment out this line when using as DLL` and `#define <id>_STATIC`. The
+  copy in `src` has that define commented out, and the source is compiled with
+  `-D<id>_EXPORTS`, so the header exports its API (for example `FLECS_API`
+  becomes `__declspec(dllexport)` or default visibility). The files in the
+  project are not modified.
+- Sources are compiled with `-fPIC` on platforms other than Windows.
+
+The emscripten target does not support shared libraries, so `--amalgamate`
+cannot be combined with `--target em`.
 
 ## Linting
 A project can run a linter on every source file bake compiles by adding a
@@ -648,9 +730,10 @@ fails with an error for other compilers (use `--cc clang --cxx clang++`) and on
 Windows and emscripten. The flags are part of the build fingerprint, so turning
 `--coverage` on or off rebuilds the affected projects.
 
-When a test project built with `--coverage` runs with `--json <path>`, the
-harness also writes a coverage report next to the test report. The `.json`
-extension of the path is replaced by `.coverage.json`:
+When `bake run` or `bake test` runs a test project built with `--coverage`
+with `--json <path>`, bake also writes a coverage report next to the test
+report once the harness has written it. The `.json` extension of the path is
+replaced by `.coverage.json`:
 
 ```sh
 bake3 run test/core --local-env --coverage -- -j 12 --json /tmp/core.json
@@ -665,7 +748,7 @@ bake3 run test/core --local-env --coverage -- -j 12 --json /tmp/core.json
   "functions": {"count": 3, "covered": 1, "percent": 33.33},
   "branches": {"count": 4, "covered": 3, "percent": 75.00},
   "files": [
-    {"file": "/home/me/work/lib/src/lib.c",
+    {"file": "lib/src/lib.c",
      "lines": {"count": 16, "covered": 8, "percent": 50.00},
      "functions": {"count": 3, "covered": 1, "percent": 33.33},
      "branches": {"count": 4, "covered": 3, "percent": 75.00},
@@ -680,16 +763,60 @@ bake3 run test/core --local-env --coverage -- -j 12 --json /tmp/core.json
 - `uncovered_lines` lists the lines that never ran as inclusive `[first, last]`
   ranges. A range spans lines without code (blank lines, comments), so it
   describes a block that did not run.
-- `uncovered_functions` lists the functions that were never called, with the
-  line they start on.
+- `uncovered_functions` lists the functions that were never called and whose
+  first line never ran, with the line they start on, sorted by line. A
+  function that is instantiated more than once (a template, or an inline
+  function in a header) is only listed when none of its instances ran, and
+  once per line. C++ names are demangled without their parameters and
+  template arguments (`tpl::box::twice` for `_ZNK3tpl3boxIiE5twiceEv`), using
+  the `llvm-cxxfilt` of the compiler (`<cc> -print-prog-name`), or
+  `llvm-cxxfilt` or `c++filt` from the `PATH` when that one is missing or does
+  not support `-p`. The html report of `coverage-report` shows the same names.
+- The `lines`, `functions` and `branches` counts are the ones `llvm-cov`
+  reports, whatever functions are listed.
 - Sources of the test project itself and generated harness sources are left
   out, so the report covers the code under test.
+- `files` is sorted by path.
+
+#### Paths and filters
+`file` is the path of the source relative to the coverage root, which is the
+directory bake runs in unless `--coverage-root <dir>` sets another one (a
+relative `<dir>` is resolved against the current directory). Sources outside
+the root keep their absolute path.
+
+`--coverage-include <patterns>` keeps only the files that match one of a comma
+separated list of patterns, and `--coverage-exclude <patterns>` leaves out the
+files that match one. A file is matched on its path relative to the root (its
+absolute path when it is outside the root):
+
+- A pattern without `*` or `?` is a path prefix that matches whole path
+  components: `src` matches `src/lib.c` and `src/sub/lib.c`, not `srcx/lib.c`.
+- A pattern with `*` or `?` is a glob that has to match the whole path. `*`
+  matches any characters except `/`, `**` also matches `/` (so `src/**/*.c`
+  matches `src/lib.c` and `src/sub/lib.c`) and `?` matches one character
+  except `/`.
+
+The totals are the sums over the files that are kept:
+
+```sh
+bake3 run test/core --local-env --coverage --coverage-include src,include \
+  --coverage-exclude 'src/addons/**' -- -j 12 --json /tmp/core.json
+```
+
+`--coverage-summary` leaves `uncovered_lines` and `uncovered_functions` out of
+the report, so every file only has its counts. This keeps reports of large
+projects small when only the numbers are needed.
+
+The options are accepted by `run` and `test` together with `--coverage`, and by
+`coverage-report`, which applies them the same way to `coverage.json`, the
+summary and the html report (`--coverage-summary` only changes
+`coverage.json`).
 
 Every case process writes its profile to `coverage/` in the build directory of
 the test project (`.bake/<arch-os-config>/coverage`, or
 `.bake/local_env/<name>/build/<project>/<arch-os-config>/coverage` with
 `--local-env`). A run of all cases or of a suite starts by removing the
-profiles of the previous run. After the run the harness merges the profiles
+profiles of the previous run. After the run bake merges the profiles
 into `coverage.profdata` with `llvm-profdata`, exports them to
 `coverage.lcov` with `llvm-cov` and converts that into the report. Both tools
 are looked up with `<cc> -print-prog-name`, so they match the compiler that
@@ -752,8 +879,9 @@ It mirrors [test projects](#test-projects): each listed benchcase is a
 `void <Suite>_<case>(bench_t *b)` function in `src/<Suite>.c`, bake generates
 stubs for cases that are missing together with the harness `main`, and
 `bake3 run bench/<name>` (or `bake3 bench <name>`) builds and runs it. Cases run
-sequentially in one process, because parallel cases would disturb each other's
-measurements.
+sequentially, because parallel cases would disturb each other's measurements,
+and every case runs in its own process, so a case that crashes or hangs only
+takes down that case and the run continues with the next one.
 
 ```json
 {
@@ -863,12 +991,46 @@ Arguments after `--` go to the benchmark binary:
 - `--threshold <frac>`: relative change that counts as a regression or an
   improvement (default 0.05).
 - `--timeout <sec>`: wall-clock limit for a single case, including its `setup`
-  and `teardown` (default 600, `0` disables it). A case that exceeds it prints
-  `TIMEOUT <Suite>.<case>` and ends the run with a non-zero exit code; because
-  benchcases share one process, the run cannot continue past a hung case.
+  and `teardown` (default 600, `0` disables it). A case that exceeds it is
+  killed and prints `TIMEOUT <Suite>.<case>`; the run continues with the next
+  case and exits with a non-zero code.
+- `--in-process`: run every case in the harness process instead of in a process
+  of its own, for example to attach a debugger or profiler to the whole run. A
+  crash then ends the run, and so does a timeout.
 - `--fail-on-regression`: exit non-zero when a case regressed beyond the
   threshold. Without it a regression is reported but the exit code stays 0.
 - `--list-benches`, `--list-suites`: print what the binary contains.
+
+### Crashes and timeouts
+The harness starts one process per case: it runs the benchmark binary again
+with the name of the case and an internal `--bench-child <file>` argument. That
+process measures the case and writes its samples to the file; the harness reads
+them back, computes the statistics and prints the line for the case. What a
+case prints itself appears above its line.
+
+A case that does not produce a result is reported on its own line and the run
+goes on:
+
+```
+Alpha.add                              0.312 ns/iter  ci95 [0.311, 0.313]  iters 32051282  samples 100  outliers 3
+CRASH Alpha.boom (signal 11: Segmentation fault: 11)
+TIMEOUT Alpha.hang (exceeded 600 seconds)
+ERROR Alpha.empty (exit code 1)
+Alpha.mul                              0.624 ns/iter  ci95 [0.622, 0.626]  iters 16025641  samples 100  outliers 1
+-----------------------------
+core: 2 benchmark(s) in 603.113s
+3 benchmark(s) failed:
+FAILED Alpha.boom (crash)
+FAILED Alpha.hang (timeout)
+FAILED Alpha.empty (error)
+```
+
+- `CRASH`: the process was ended by a signal (an exception code on Windows).
+- `TIMEOUT`: the case exceeded `--timeout` and was killed.
+- `ERROR`: the process exited with a non-zero code or without a result, for
+  example because the case never called `bench_iter`.
+
+Any failed case makes the run exit with a non-zero code.
 
 A baseline comparison adds the relative change to each line and lists the
 regressions at the end:
@@ -882,8 +1044,8 @@ REGRESSION Entity.new +22.9%
 ```
 
 ### Report format
-`--json` writes every statistic in nanoseconds, plus the raw samples, in the
-same field style as the test report:
+`--json` writes the summary statistics of every case in nanoseconds, in the
+same field style as the test report. Individual samples are not stored:
 
 ```json
 {
@@ -895,12 +1057,15 @@ same field style as the test report:
   "samples": 100,
   "time_budget_sec": 1.0,
   "sample_target_sec": 0.01,
+  "isolation": "process",
   "cases": 1,
+  "failed": 1,
   "time_sec": 1.204,
   "benchmarks": [
     {
       "suite": "Entity",
       "case": "new",
+      "status": "ok",
       "iterations": 397000,
       "samples": 100,
       "total_iterations": 39700000,
@@ -912,15 +1077,24 @@ same field style as the test report:
       "outliers": 4, "outliers_severe": 1,
       "items_per_iter": 1, "items_per_sec": 39366898.0,
       "time_sec": 1.204,
-      "counters": [{"name": "entities", "total": 39700000.0, "per_iter": 1.0}],
-      "sample_ns": [25.31, 25.28, 25.44]
+      "counters": [{"name": "entities", "total": 39700000.0, "per_iter": 1.0}]
     }
+  ],
+  "failures": [
+    {"suite": "Entity", "case": "delete", "status": "crash", "signal": 11, "time_sec": 0.052}
   ]
 }
 ```
 
 `items_per_sec` is only written when `bench_set_items` was called, and
 `baseline_median_ns` and `change` are added per case when `--baseline` is used.
+
+`benchmarks` holds the cases that produced a result, with `status` `ok`, and
+`cases` counts them. `failures` holds the cases that did not, and `failed`
+counts them. A failure has a `status` of `crash`, `timeout` or `error`, the
+`signal` that ended the process (POSIX crashes) or its `exit_code` when it is not
+zero, and the wall-clock `time_sec` the case took until it ended. `isolation` is
+`process`, or `none` for a run with `--in-process`.
 
 ## Build reports
 `--build-json <file>` writes one json document that describes the build bake
@@ -1033,7 +1207,9 @@ clock start and duration, so sibling compiles overlap.
 - `generate`: generated code. `test harness main` / `bench harness main` and
   `test api` / `bench api` for test and benchmark projects, `bake_config.h` for
   every project, plus `rules`, `amalgamate` and `standalone deps` when the
-  project uses them.
+  project uses them. With `--amalgamate` the `amalgamate` step that refreshes
+  and copies the amalgamated files runs before the `loc` step, outside the
+  project step, so the lines of code of the copied files are counted.
 - `compile`: one step per source file that was actually compiled, named after
   the source path relative to the project, with the `object` path it produced.
   Files that were up to date do not appear. When the project has a `lint`
@@ -1044,6 +1220,9 @@ clock start and duration, so sibling compiles overlap.
   part of the link, so that step records what is embedded and only times the
   arguments bake composes for it.
 - `etc`: the install of the project's `etc` folder into the bake environment.
+- `loc`: the lines of code of a project, counted with `cloc` when it is
+  installed. The counts are reported in `totals.project.<id>.loc` and
+  `totals.loc`. Set `BAKE_BUILD_REPORT_LOC=0` to skip the count.
 
 ### Totals
 `totals` repeats the same numbers in aggregated form, so a page can show
@@ -1058,6 +1237,52 @@ of the build.
 `totals.project` holds one entry per project: `total_sec` (the time of the
 steps bake spent on that project, which includes its bundles), `compile_sec`,
 `link_sec` and `files`, the number of source files that were compiled.
+
+### Repeated builds
+`--repeat <n>` runs a `build` or `rebuild` `n` times and writes the report of
+the median run to `--build-json`, which it requires. `--warmup <n>` adds `n`
+runs before them that are not measured, so caches are warm when the measured
+runs start. `--warmup` without `--repeat` measures a single run:
+
+```sh
+bake3 rebuild --local-env --repeat 3 --warmup 1 -j 1 --build-json /tmp/build.json
+```
+
+Every run is a separate bake invocation with the same arguments, so each one
+does its own discovery, clean and build, exactly like running the command `n`
+times. The runs are compared by `total_sec` minus `totals.kind.loc`: lines of
+code are only counted in the first run (the first warm-up when there is one),
+and the counts of that run are copied into the reported one. When the reported
+run is not the first run, it has no `loc` step and `totals.kind.loc` is 0, so
+`total_sec - totals.kind.loc` is the build time of the run in both cases. With
+an even count the lower of the two middle runs is the median.
+
+The report gets a `repeat` object:
+
+```json
+"repeat": {
+  "warmup": 1,
+  "count": 3,
+  "chosen_run": 2,
+  "median_sec": 5.106315,
+  "runs": [
+    {"run": 0, "warmup": true, "ok": true, "exit_code": 0, "total_sec": 5.342540, "loc_sec": 0.217835},
+    {"run": 1, "warmup": false, "ok": true, "exit_code": 0, "total_sec": 5.113472, "loc_sec": 0},
+    {"run": 2, "warmup": false, "ok": true, "exit_code": 0, "total_sec": 5.106315, "loc_sec": 0},
+    {"run": 3, "warmup": false, "ok": true, "exit_code": 0, "total_sec": 5.138264, "loc_sec": 0}
+  ]
+}
+```
+
+- `warmup`, `count`: the `--warmup` and `--repeat` values.
+- `chosen_run`: index in `runs` of the run the report describes.
+- `median_sec`: the median of `total_sec - loc_sec` over the measured runs.
+- `runs`: every run in the order it ran, with its exit code, `total_sec` and
+  the time it spent counting lines of code.
+
+The repetition stops at the first run that fails. The report of that run is
+written with `chosen_run` and `median_sec` set to `null`, and bake exits with
+an error.
 
 ## Project discovery
 When bake is called on a directory, it will recursively discover all other bake projects in that directory. A bake project is identified as a project with a `project.json`. The command specified on the bake command line will then be executed for all discovered projects.

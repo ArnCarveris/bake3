@@ -58,6 +58,13 @@ typedef struct bake_cov_report_t {
     bake_cov_totals_t totals;
     char *out_dir;
     char *title;
+    char *root;
+    char *root_resolved;
+    bake_strlist_t include;
+    bake_strlist_t exclude;
+    bool keep_empty;
+    bool merged;
+    bool summary;
 } bake_cov_report_t;
 
 char* bake_coverage_report_dir(void) {
@@ -115,6 +122,172 @@ static void bake_cov_report_fini(bake_cov_report_t *report) {
 
     ecs_os_free(report->out_dir);
     ecs_os_free(report->title);
+    ecs_os_free(report->root);
+    ecs_os_free(report->root_resolved);
+    bake_strlist_fini(&report->include);
+    bake_strlist_fini(&report->exclude);
+}
+
+static bool bake_cov_has_glob(const char *pattern) {
+    return strpbrk(pattern, "*?") != NULL;
+}
+
+static bool bake_cov_glob(const char *pattern, const char *path) {
+    for (;;) {
+        if (!pattern[0]) {
+            return !path[0];
+        }
+
+        if (pattern[0] == '*' && pattern[1] == '*') {
+            const char *rest = pattern + 2;
+            if (rest[0] == '/' && bake_cov_glob(rest + 1, path)) {
+                return true;
+            }
+            for (const char *cur = path;; cur++) {
+                if (bake_cov_glob(rest, cur)) {
+                    return true;
+                }
+                if (!cur[0]) {
+                    return false;
+                }
+            }
+        }
+
+        if (pattern[0] == '*') {
+            for (const char *cur = path;; cur++) {
+                if (bake_cov_glob(pattern + 1, cur)) {
+                    return true;
+                }
+                if (!cur[0] || cur[0] == '/') {
+                    return false;
+                }
+            }
+        }
+
+        if (!path[0]) {
+            return false;
+        }
+        if (pattern[0] == '?' ? path[0] == '/' : pattern[0] != path[0]) {
+            return false;
+        }
+        pattern++;
+        path++;
+    }
+}
+
+bool bake_coverage_path_matches(const char *pattern, const char *path) {
+    if (!pattern || !path) {
+        return false;
+    }
+    while (pattern[0] == '.' && pattern[1] == '/') {
+        pattern += 2;
+    }
+    if (bake_cov_has_glob(pattern)) {
+        return bake_cov_glob(pattern, path);
+    }
+
+    size_t len = strlen(pattern);
+    while (len && pattern[len - 1] == '/') {
+        len--;
+    }
+    if (!len) {
+        return false;
+    }
+    return !strncmp(path, pattern, len) && (path[len] == '\0' || path[len] == '/');
+}
+
+static void bake_cov_parse_patterns(const char *value, bake_strlist_t *out) {
+    bake_strlist_init(out);
+    if (!value) {
+        return;
+    }
+
+    const char *cur = value;
+    while (*cur) {
+        const char *end = strchr(cur, ',');
+        size_t len = end ? (size_t)(end - cur) : strlen(cur);
+        while (len && bake_char_is_space(*cur)) {
+            cur++;
+            len--;
+        }
+        while (len && bake_char_is_space(cur[len - 1])) {
+            len--;
+        }
+        if (len) {
+            char *pattern = ecs_os_malloc((ecs_size_t)len + 1);
+            memcpy(pattern, cur, len);
+            pattern[len] = '\0';
+            bake_strlist_append_owned(out, pattern);
+        }
+        if (!end) {
+            break;
+        }
+        cur = end + 1;
+    }
+}
+
+static int bake_cov_report_init(bake_cov_report_t *report, bake_context_t *ctx) {
+    memset(report, 0, sizeof(*report));
+    report->ctx = ctx;
+    report->summary = ctx->opts.coverage_summary;
+    ecs_vec_init_t(NULL, &report->projects, bake_cov_project_t, 0);
+    ecs_vec_init_t(NULL, &report->profiles, char*, 0);
+    ecs_vec_init_t(NULL, &report->files, bake_cov_file_t*, 0);
+    bake_cov_parse_patterns(ctx->opts.coverage_include, &report->include);
+    bake_cov_parse_patterns(ctx->opts.coverage_exclude, &report->exclude);
+
+    const char *root = ctx->opts.coverage_root;
+    if (!root || !root[0]) {
+        root = ctx->opts.cwd;
+    }
+    report->root = bake_path_is_abs(root)
+        ? ecs_os_strdup(root)
+        : bake_path_join(ctx->opts.cwd, root);
+    size_t len = strlen(report->root);
+    while (len > 1 && bake_path_is_sep(report->root[len - 1])) {
+        report->root[--len] = '\0';
+    }
+
+    if (!bake_path_is_dir(report->root)) {
+        ecs_err("coverage root '%s' is not a directory", report->root);
+        return -1;
+    }
+    report->root_resolved = bake_path_resolve(report->root);
+    return 0;
+}
+
+static char* bake_cov_relative_path(const bake_cov_report_t *report, const char *path) {
+    const char *roots[] = { report->root, report->root_resolved };
+    for (int32_t i = 0; i < 2; i++) {
+        size_t len = 0;
+        if (!roots[i] || !bake_path_has_prefix_normalized(path, roots[i], &len)) {
+            continue;
+        }
+        const char *rel = path + len;
+        while (*rel && bake_path_is_sep(*rel)) {
+            rel++;
+        }
+        if (*rel) {
+            return ecs_os_strdup(rel);
+        }
+    }
+    return ecs_os_strdup(path);
+}
+
+static bool bake_cov_path_selected(const bake_cov_report_t *report, const char *path) {
+    bool included = report->include.count == 0;
+    for (int32_t i = 0; !included && i < report->include.count; i++) {
+        included = bake_coverage_path_matches(report->include.items[i], path);
+    }
+    if (!included) {
+        return false;
+    }
+    for (int32_t i = 0; i < report->exclude.count; i++) {
+        if (bake_coverage_path_matches(report->exclude.items[i], path)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool bake_cov_is_profile(const char *name) {
@@ -199,7 +372,7 @@ static int bake_cov_collect_projects(
                 continue;
             }
 
-            char *build_root = bake_project_build_root(cfg->path, cfg->id, mode);
+            char *build_root = bake_project_cfg_build_root(cfg, mode);
             char *artefact = bake_project_cfg_artefact_name(cfg);
             char *exe = build_root && artefact
                 ? bake_path_join(build_root, artefact)
@@ -323,20 +496,6 @@ static const char* bake_cov_fn_name(const char *name) {
     return sep ? sep + 1 : name;
 }
 
-static char* bake_cov_display_path(const char *path, const char *cwd) {
-    size_t len = 0;
-    if (cwd && bake_path_has_prefix_normalized(path, cwd, &len)) {
-        const char *rel = path + len;
-        while (*rel && bake_path_is_sep(*rel)) {
-            rel ++;
-        }
-        if (*rel) {
-            return ecs_os_strdup(rel);
-        }
-    }
-    return ecs_os_strdup(path);
-}
-
 static void bake_cov_add_totals(bake_cov_totals_t *dst, const bake_cov_totals_t *src) {
     dst->lines.count += src->lines.count;
     dst->lines.covered += src->lines.covered;
@@ -449,9 +608,12 @@ static int bake_cov_parse_lcov(bake_cov_report_t *report, const char *lcov_path)
             ecs_vec_init_t(NULL, &file->fns, bake_cov_fn_t, 0);
         } else if (!strcmp(line, "end_of_record")) {
             if (file && !bake_cov_excluded(report, file->path) &&
-                (file->totals.lines.count || file->totals.functions.count))
+                (report->keep_empty || file->totals.lines.count ||
+                    file->totals.functions.count))
             {
-                file->display = bake_cov_display_path(file->path, report->ctx->opts.cwd);
+                file->display = bake_cov_relative_path(report, file->path);
+            }
+            if (file && file->display && bake_cov_path_selected(report, file->display)) {
                 bake_cov_add_totals(&report->totals, &file->totals);
                 *ecs_vec_append_t(NULL, &report->files, bake_cov_file_t*) = file;
             } else if (file) {
@@ -474,6 +636,255 @@ static int bake_cov_parse_lcov(bake_cov_report_t *report, const char *lcov_path)
             sizeof(bake_cov_file_t*), bake_cov_file_compare);
     }
     return 0;
+}
+
+static const char *bake_cov_cxx_operators[] = {
+    "<=>", "<<=", ">>=", "->*", "()", "[]", "<<", ">>", "<=", ">=", "==", "!=",
+    "&&", "||", "++", "--", "->", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
+    "+", "-", "*", "/", "%", "^", "&", "|", "~", "!", "=", "<", ">", ",", NULL
+};
+
+#define BAKE_COV_ANON_NS "(anonymous namespace)"
+
+char* bake_coverage_simplify_name(const char *name, bool strip_params) {
+    ecs_strbuf_t buf = ECS_STRBUF_INIT;
+    size_t anon_len = strlen(BAKE_COV_ANON_NS);
+    int32_t depth = 0;
+    const char *ch = name;
+    while (*ch) {
+        bool ident_start = ch == name || !bake_harness_char_is_ident(ch[-1]);
+        if (!depth && ident_start && !strncmp(ch, "operator", 8)) {
+            const char *end = ch + 8;
+            for (int32_t i = 0; bake_cov_cxx_operators[i]; i++) {
+                size_t len = strlen(bake_cov_cxx_operators[i]);
+                if (!strncmp(end, bake_cov_cxx_operators[i], len)) {
+                    end += len;
+                    break;
+                }
+            }
+            ecs_strbuf_appendstrn(&buf, ch, (int32_t)(end - ch));
+            ch = end;
+            continue;
+        }
+        if (!depth && !strncmp(ch, BAKE_COV_ANON_NS, anon_len)) {
+            ecs_strbuf_appendstrn(&buf, ch, (int32_t)anon_len);
+            ch += anon_len;
+            continue;
+        }
+        if (*ch == '<') {
+            depth++;
+        } else if (*ch == '>' && depth) {
+            depth--;
+        } else if (!depth) {
+            if (strip_params && *ch == '(') {
+                break;
+            }
+            ecs_strbuf_appendch(&buf, *ch);
+        }
+        ch++;
+    }
+    char *result = ecs_strbuf_get(&buf);
+    return result ? result : ecs_os_strdup("");
+}
+
+static char* bake_cov_find_program(const char *name) {
+    if (!name || !name[0]) {
+        return NULL;
+    }
+    if (strchr(name, '/')) {
+        return bake_path_exists(name) ? ecs_os_strdup(name) : NULL;
+    }
+
+    const char *path = getenv("PATH");
+    while (path && *path) {
+        const char *end = strchr(path, ':');
+        size_t len = end ? (size_t)(end - path) : strlen(path);
+        if (len) {
+            char *dir = ecs_os_malloc((ecs_size_t)len + 1);
+            memcpy(dir, path, len);
+            dir[len] = '\0';
+            char *candidate = bake_path_join(dir, name);
+            ecs_os_free(dir);
+            if (bake_path_exists(candidate) && !bake_path_is_dir(candidate)) {
+                return candidate;
+            }
+            ecs_os_free(candidate);
+        }
+        if (!end) {
+            break;
+        }
+        path = end + 1;
+    }
+    return NULL;
+}
+
+static void bake_cov_demangler_candidates(
+    const bake_cov_report_t *report,
+    bake_strlist_t *out)
+{
+    bake_strlist_init(out);
+    char *toolchain = bake_coverage_tool(report->ctx, "llvm-cxxfilt");
+    const char *names[] = { toolchain, "llvm-cxxfilt", "c++filt" };
+    for (int32_t i = 0; i < 3; i++) {
+        char *found = bake_cov_find_program(names[i]);
+        if (found && !bake_strlist_contains(out, found)) {
+            bake_strlist_append_owned(out, found);
+        } else {
+            ecs_os_free(found);
+        }
+    }
+    ecs_os_free(toolchain);
+}
+
+static char** bake_cov_run_demangler(
+    const char *tool,
+    bool no_params,
+    const char *in_path,
+    const char *out_path,
+    const char *err_path,
+    int32_t count)
+{
+    const char *argv[] = { tool, "-n", no_params ? "-p" : NULL, NULL };
+    bake_process_stdio_t stdio_cfg = {
+        .stdin_path = in_path,
+        .stdout_path = out_path,
+        .stderr_path = err_path
+    };
+    bake_process_result_t result = {0};
+    if (bake_proc_run(argv, &stdio_cfg, &result) != 0 || result.exit_code != 0) {
+        return NULL;
+    }
+
+    char *content = bake_file_read(out_path, NULL);
+    if (!content) {
+        return NULL;
+    }
+
+    char **names = ecs_os_calloc_n(char*, count);
+    char *cur = content;
+    int32_t i = 0;
+    for (; i < count && *cur; i++) {
+        char *nl = strchr(cur, '\n');
+        size_t len = nl ? (size_t)(nl - cur) : strlen(cur);
+        names[i] = ecs_os_malloc((ecs_size_t)len + 1);
+        memcpy(names[i], cur, len);
+        names[i][len] = '\0';
+        cur = nl ? nl + 1 : cur + len;
+    }
+    ecs_os_free(content);
+
+    if (i < count) {
+        for (int32_t j = 0; j < i; j++) {
+            ecs_os_free(names[j]);
+        }
+        ecs_os_free(names);
+        return NULL;
+    }
+    return names;
+}
+
+static int bake_cov_name_compare(const void *a, const void *b) {
+    return strcmp(*(char* const*)a, *(char* const*)b);
+}
+
+static void bake_cov_demangle(bake_cov_report_t *report, const char *work_dir) {
+    bake_strlist_t mangled;
+    bake_strlist_init(&mangled);
+    int32_t file_count = ecs_vec_count(&report->files);
+    bake_cov_file_t **files = ecs_vec_first_t(&report->files, bake_cov_file_t*);
+    for (int32_t i = 0; i < file_count; i++) {
+        int32_t fn_count = ecs_vec_count(&files[i]->fns);
+        bake_cov_fn_t *fns = ecs_vec_first_t(&files[i]->fns, bake_cov_fn_t);
+        for (int32_t f = 0; f < fn_count; f++) {
+            if (!strncmp(fns[f].name, "_Z", 2)) {
+                bake_strlist_append(&mangled, fns[f].name);
+            }
+        }
+    }
+
+    char **demangled = NULL;
+    bool strip_params = false;
+    if (mangled.count) {
+        qsort(mangled.items, (size_t)mangled.count, sizeof(char*), bake_cov_name_compare);
+        int32_t unique = 0;
+        for (int32_t i = 0; i < mangled.count; i++) {
+            if (unique && !strcmp(mangled.items[unique - 1], mangled.items[i])) {
+                ecs_os_free(mangled.items[i]);
+                continue;
+            }
+            mangled.items[unique++] = mangled.items[i];
+        }
+        mangled.count = unique;
+
+        char *joined = bake_strlist_join(&mangled, "\n");
+        char *in_path = bake_path_join(work_dir, "demangle.in");
+        char *out_path = bake_path_join(work_dir, "demangle.out");
+        char *err_path = bake_path_join(work_dir, "demangle.err");
+        ecs_strbuf_t input = ECS_STRBUF_INIT;
+        ecs_strbuf_appendstr(&input, joined);
+        ecs_strbuf_appendch(&input, '\n');
+        char *input_str = ecs_strbuf_get(&input);
+
+        if (bake_file_write(in_path, input_str) == 0) {
+            bake_strlist_t tools;
+            bake_cov_demangler_candidates(report, &tools);
+            for (int32_t pass = 0; pass < 2 && !demangled; pass++) {
+                for (int32_t t = 0; t < tools.count && !demangled; t++) {
+                    demangled = bake_cov_run_demangler(tools.items[t], pass == 0,
+                        in_path, out_path, err_path, mangled.count);
+                }
+                strip_params = pass == 1;
+            }
+            if (!demangled) {
+                ecs_warn("no working llvm-cxxfilt or c++filt found, coverage "
+                    "reports use mangled function names");
+            }
+            bake_strlist_fini(&tools);
+        }
+
+        bake_remove_file_if_exists(in_path);
+        bake_remove_file_if_exists(out_path);
+        bake_remove_file_if_exists(err_path);
+        ecs_os_free(err_path);
+        ecs_os_free(input_str);
+        ecs_os_free(joined);
+        ecs_os_free(in_path);
+        ecs_os_free(out_path);
+    }
+
+    for (int32_t i = 0; i < file_count; i++) {
+        int32_t fn_count = ecs_vec_count(&files[i]->fns);
+        bake_cov_fn_t *fns = ecs_vec_first_t(&files[i]->fns, bake_cov_fn_t);
+        for (int32_t f = 0; f < fn_count; f++) {
+            const char *name = fns[f].name;
+            bool is_mangled = !strncmp(name, "_Z", 2);
+            if (is_mangled && demangled) {
+                char **match = bsearch(&name, mangled.items, (size_t)mangled.count,
+                    sizeof(char*), bake_cov_name_compare);
+                const char *full = match ? demangled[match - mangled.items] : NULL;
+                if (full && full[0]) {
+                    name = full;
+                }
+            }
+            if (!is_mangled || demangled) {
+                char *simple = bake_coverage_simplify_name(name, is_mangled && strip_params);
+                if (simple[0]) {
+                    ecs_os_free(fns[f].name);
+                    fns[f].name = simple;
+                } else {
+                    ecs_os_free(simple);
+                }
+            }
+        }
+    }
+
+    if (demangled) {
+        for (int32_t i = 0; i < mangled.count; i++) {
+            ecs_os_free(demangled[i]);
+        }
+        ecs_os_free(demangled);
+    }
+    bake_strlist_fini(&mangled);
 }
 
 static void bake_cov_json_str(ecs_strbuf_t *buf, const char *str, size_t len) {
@@ -672,45 +1083,116 @@ static int bake_cov_write_index(
     return rc;
 }
 
-static void bake_cov_json_ranges(ecs_strbuf_t *buf, const bake_cov_file_t *file) {
+typedef struct bake_cov_range_t {
+    int64_t first;
+    int64_t last;
+} bake_cov_range_t;
+
+static void bake_cov_uncovered_ranges(const bake_cov_file_t *file, ecs_vec_t *out) {
     int32_t count = ecs_vec_count(&file->lines);
     const bake_cov_line_t *lines = ecs_vec_first_t(&file->lines, bake_cov_line_t);
-    bool in_range = false;
-    bool first = true;
-    int64_t start = 0, end = 0;
-    for (int32_t i = 0; i <= count; i++) {
-        bool uncovered = i < count && !lines[i].hits;
-        if (uncovered) {
-            if (!in_range) {
-                start = lines[i].line;
-                in_range = true;
-            }
-            end = lines[i].line;
+    bake_cov_range_t *range = NULL;
+    for (int32_t i = 0; i < count; i++) {
+        if (lines[i].hits) {
+            range = NULL;
             continue;
         }
-        if (in_range) {
-            ecs_strbuf_append(buf, "%s[%lld, %lld]", first ? "" : ", ",
-                (long long)start, (long long)end);
-            first = false;
-            in_range = false;
+        if (!range) {
+            range = ecs_vec_append_t(NULL, out, bake_cov_range_t);
+            range->first = lines[i].line;
         }
+        range->last = lines[i].line;
     }
 }
 
-static int bake_cov_write_json(const bake_cov_report_t *report, const char *stamp) {
+static bool bake_cov_in_ranges(const ecs_vec_t *ranges, int64_t line) {
+    int32_t count = ecs_vec_count(ranges);
+    const bake_cov_range_t *items = ecs_vec_first_t(ranges, bake_cov_range_t);
+    for (int32_t i = 0; i < count; i++) {
+        if (line >= items[i].first && line <= items[i].last) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int bake_cov_fn_line_compare(const void *a, const void *b) {
+    const bake_cov_fn_t *fa = *(const bake_cov_fn_t* const*)a;
+    const bake_cov_fn_t *fb = *(const bake_cov_fn_t* const*)b;
+    if (fa->line != fb->line) {
+        return fa->line < fb->line ? -1 : 1;
+    }
+    return fa < fb ? -1 : (fa > fb);
+}
+
+static void bake_cov_json_uncovered(ecs_strbuf_t *buf, const bake_cov_file_t *file) {
+    ecs_vec_t ranges;
+    ecs_vec_init_t(NULL, &ranges, bake_cov_range_t, 0);
+    bake_cov_uncovered_ranges(file, &ranges);
+
+    ecs_strbuf_appendstr(buf, ",\n     \"uncovered_lines\": [");
+    int32_t range_count = ecs_vec_count(&ranges);
+    const bake_cov_range_t *range_items = ecs_vec_first_t(&ranges, bake_cov_range_t);
+    for (int32_t i = 0; i < range_count; i++) {
+        ecs_strbuf_append(buf, "%s[%lld, %lld]", i ? ", " : "",
+            (long long)range_items[i].first, (long long)range_items[i].last);
+    }
+
+    int32_t fn_count = ecs_vec_count(&file->fns);
+    const bake_cov_fn_t *fns = ecs_vec_first_t(&file->fns, bake_cov_fn_t);
+    const bake_cov_fn_t **uncovered = ecs_os_malloc_n(const bake_cov_fn_t*, fn_count + 1);
+    int32_t uncovered_count = 0;
+    for (int32_t f = 0; f < fn_count; f++) {
+        if (!fns[f].hits && bake_cov_in_ranges(&ranges, fns[f].line)) {
+            uncovered[uncovered_count++] = &fns[f];
+        }
+    }
+    if (uncovered_count > 1) {
+        qsort(uncovered, (size_t)uncovered_count, sizeof(bake_cov_fn_t*),
+            bake_cov_fn_line_compare);
+    }
+
+    ecs_strbuf_appendstr(buf, "],\n     \"uncovered_functions\": [");
+    int64_t prev_line = -1;
+    bool first = true;
+    for (int32_t f = 0; f < uncovered_count; f++) {
+        if (uncovered[f]->line == prev_line) {
+            continue;
+        }
+        prev_line = uncovered[f]->line;
+        ecs_strbuf_appendstr(buf, first ? "{\"name\": " : ", {\"name\": ");
+        bake_cov_json_cstr(buf, uncovered[f]->name);
+        ecs_strbuf_append(buf, ", \"line\": %lld}", (long long)uncovered[f]->line);
+        first = false;
+    }
+    ecs_strbuf_appendstr(buf, "]");
+
+    ecs_os_free(uncovered);
+    ecs_vec_fini_t(NULL, &ranges, bake_cov_range_t);
+}
+
+static int bake_cov_write_json(
+    const bake_cov_report_t *report,
+    const char *stamp,
+    const char *path)
+{
     ecs_strbuf_t buf = ECS_STRBUF_INIT;
     ecs_strbuf_appendstr(&buf, "{\n  \"project\": ");
     bake_cov_json_cstr(&buf, report->title);
     ecs_strbuf_appendstr(&buf, ",\n  \"timestamp\": ");
     bake_cov_json_cstr(&buf, stamp);
-    ecs_strbuf_appendstr(&buf, ",\n  \"projects\": [");
-    int32_t project_count = ecs_vec_count(&report->projects);
-    const bake_cov_project_t *projects = ecs_vec_first_t(&report->projects, bake_cov_project_t);
-    for (int32_t i = 0; i < project_count; i++) {
-        if (i) ecs_strbuf_appendstr(&buf, ", ");
-        bake_cov_json_cstr(&buf, projects[i].cfg->id);
+    ecs_strbuf_appendstr(&buf, ",\n");
+    if (report->merged) {
+        ecs_strbuf_appendstr(&buf, "  \"projects\": [");
+        int32_t project_count = ecs_vec_count(&report->projects);
+        const bake_cov_project_t *projects = ecs_vec_first_t(
+            &report->projects, bake_cov_project_t);
+        for (int32_t i = 0; i < project_count; i++) {
+            if (i) ecs_strbuf_appendstr(&buf, ", ");
+            bake_cov_json_cstr(&buf, projects[i].cfg->id);
+        }
+        ecs_strbuf_appendstr(&buf, "],\n");
     }
-    ecs_strbuf_appendstr(&buf, "],\n");
     bake_cov_json_totals(&buf, "  ", &report->totals);
     ecs_strbuf_appendstr(&buf, ",\n  \"files\": [");
 
@@ -719,32 +1201,21 @@ static int bake_cov_write_json(const bake_cov_report_t *report, const char *stam
     for (int32_t i = 0; i < file_count; i++) {
         const bake_cov_file_t *file = files[i];
         ecs_strbuf_appendstr(&buf, i ? ",\n    {\"file\": " : "\n    {\"file\": ");
-        bake_cov_json_cstr(&buf, file->path);
+        bake_cov_json_cstr(&buf, file->display);
         ecs_strbuf_appendstr(&buf, ",\n");
         bake_cov_json_totals(&buf, "     ", &file->totals);
-        ecs_strbuf_appendstr(&buf, ",\n     \"uncovered_lines\": [");
-        bake_cov_json_ranges(&buf, file);
-        ecs_strbuf_appendstr(&buf, "],\n     \"uncovered_functions\": [");
-        int32_t fn_count = ecs_vec_count(&file->fns);
-        const bake_cov_fn_t *fns = ecs_vec_first_t(&file->fns, bake_cov_fn_t);
-        bool first = true;
-        for (int32_t f = 0; f < fn_count; f++) {
-            if (fns[f].hits) {
-                continue;
-            }
-            ecs_strbuf_appendstr(&buf, first ? "{\"name\": " : ", {\"name\": ");
-            bake_cov_json_cstr(&buf, fns[f].name);
-            ecs_strbuf_append(&buf, ", \"line\": %lld}", (long long)fns[f].line);
-            first = false;
+        if (!report->summary) {
+            bake_cov_json_uncovered(&buf, file);
         }
-        ecs_strbuf_appendstr(&buf, "]}");
+        ecs_strbuf_appendstr(&buf, "}");
     }
     ecs_strbuf_appendstr(&buf, file_count ? "\n  ]\n}\n" : "]\n}\n");
 
     char *content = ecs_strbuf_get(&buf);
-    char *path = bake_path_join(report->out_dir, "coverage.json");
     int rc = bake_file_write(path, content);
-    ecs_os_free(path);
+    if (rc != 0) {
+        ecs_err("failed to write coverage report '%s'", path);
+    }
     ecs_os_free(content);
     return rc;
 }
@@ -832,17 +1303,19 @@ static void bake_cov_print_summary(const bake_cov_report_t *report) {
 }
 
 int bake_coverage_report_generate(bake_context_t *ctx, const char *target_path) {
-    bake_cov_report_t report = { .ctx = ctx };
-    ecs_vec_init_t(NULL, &report.projects, bake_cov_project_t, 0);
-    ecs_vec_init_t(NULL, &report.profiles, char*, 0);
-    ecs_vec_init_t(NULL, &report.files, bake_cov_file_t*, 0);
-
+    bake_cov_report_t report;
     int rc = -1;
     char *root = NULL;
     char *profdata = NULL;
     char *lcov = NULL;
     char *files_dir = NULL;
+    char *json_path = NULL;
     const char *target_id = NULL;
+
+    if (bake_cov_report_init(&report, ctx) != 0) {
+        goto cleanup;
+    }
+    report.merged = true;
 
     if (target_path) {
         root = bake_path_resolve(target_path);
@@ -881,6 +1354,7 @@ int bake_coverage_report_generate(bake_context_t *ctx, const char *target_path) 
     if (bake_cov_parse_lcov(&report, lcov) != 0) {
         goto cleanup;
     }
+    bake_cov_demangle(&report, report.out_dir);
 
     files_dir = bake_path_join(report.out_dir, "files");
     if (bake_path_exists(files_dir) && bake_os_rmtree(files_dir) != 0) {
@@ -901,8 +1375,9 @@ int bake_coverage_report_generate(bake_context_t *ctx, const char *target_path) 
         }
     }
 
+    json_path = bake_path_join(report.out_dir, "coverage.json");
     if (bake_cov_write_index(&report, stamp) != 0 ||
-        bake_cov_write_json(&report, stamp) != 0)
+        bake_cov_write_json(&report, stamp, json_path) != 0)
     {
         goto cleanup;
     }
@@ -918,6 +1393,95 @@ cleanup:
     ecs_os_free(profdata);
     ecs_os_free(lcov);
     ecs_os_free(files_dir);
+    ecs_os_free(json_path);
+    bake_cov_report_fini(&report);
+    return rc;
+}
+
+static bool bake_cov_add_project(
+    bake_cov_report_t *report,
+    const bake_project_cfg_t *cfg,
+    const char *exe)
+{
+    const char *mode = report->ctx->opts.mode;
+    char *coverage_dir = bake_coverage_dir(cfg, mode);
+    int32_t found = coverage_dir
+        ? bake_cov_collect_profiles(report, coverage_dir)
+        : 0;
+    if (!found) {
+        ecs_err("no coverage data found in %s", coverage_dir ? coverage_dir : cfg->id);
+        ecs_os_free(coverage_dir);
+        return false;
+    }
+    ecs_os_free(coverage_dir);
+
+    bake_cov_project_t *project = ecs_vec_append_t(
+        NULL, &report->projects, bake_cov_project_t);
+    project->cfg = cfg;
+    project->exe = bake_path_resolve(exe);
+    if (!project->exe) {
+        project->exe = ecs_os_strdup(exe);
+    }
+    project->build_root = bake_project_cfg_build_root(cfg, mode);
+    project->resolved_path = bake_path_resolve(cfg->path);
+    return true;
+}
+
+int bake_coverage_project_report(
+    bake_context_t *ctx,
+    const bake_project_cfg_t *cfg,
+    const char *exe,
+    const char *json_path)
+{
+    bake_cov_report_t report;
+    int rc = -1;
+    char *coverage_dir = NULL;
+    char *profdata = NULL;
+    char *lcov = NULL;
+
+    if (bake_cov_report_init(&report, ctx) != 0) {
+        goto cleanup;
+    }
+    report.keep_empty = true;
+    report.title = ecs_os_strdup(cfg->id);
+
+    if (!bake_cov_add_project(&report, cfg, exe) ||
+        bake_coverage_init_tools(ctx) != 0)
+    {
+        goto cleanup;
+    }
+
+    coverage_dir = bake_coverage_dir(cfg, ctx->opts.mode);
+    profdata = bake_path_join(coverage_dir, "coverage.profdata");
+    lcov = bake_path_join(coverage_dir, "coverage.lcov");
+    if (bake_cov_merge_and_export(&report, profdata, lcov) != 0 ||
+        bake_cov_parse_lcov(&report, lcov) != 0)
+    {
+        goto cleanup;
+    }
+    bake_cov_demangle(&report, coverage_dir);
+
+    char stamp[64] = {0};
+    bake_cov_timestamp(stamp, sizeof(stamp));
+    if (bake_cov_write_json(&report, stamp, json_path) != 0) {
+        goto cleanup;
+    }
+
+    const bake_cov_totals_t *t = &report.totals;
+    printf("coverage: %.2f%% lines (%lld/%lld), %.2f%% functions (%lld/%lld), "
+        "%.2f%% branches (%lld/%lld)\n",
+        bake_cov_percent(&t->lines),
+        (long long)t->lines.covered, (long long)t->lines.count,
+        bake_cov_percent(&t->functions),
+        (long long)t->functions.covered, (long long)t->functions.count,
+        bake_cov_percent(&t->branches),
+        (long long)t->branches.covered, (long long)t->branches.count);
+    rc = 0;
+
+cleanup:
+    ecs_os_free(coverage_dir);
+    ecs_os_free(profdata);
+    ecs_os_free(lcov);
     bake_cov_report_fini(&report);
     return rc;
 }
