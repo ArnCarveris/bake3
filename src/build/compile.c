@@ -248,6 +248,7 @@ typedef struct bake_compile_ctx_t {
     int32_t compile_total;
     int32_t compile_done;
     ecs_os_mutex_t print_lock;
+    int32_t lint_unavailable;
     int32_t cursor;
     int32_t failed;
 } bake_compile_ctx_t;
@@ -350,6 +351,13 @@ static void bake_lint_print_output(
 static int bake_lint_single(bake_compile_ctx_t *ctx, const bake_compile_unit_t *unit) {
     const bake_lint_cfg_t *lint = &ctx->cfg->lint;
     bake_lint_action_t action = ctx->ctx->opts.fix_lint ? BAKE_LINT_AUTOFIX : lint->action;
+
+    /* A linter that only logs and could not be started is skipped for the
+     * rest of the build: starting it again for every file only stalls it. */
+    if (action == BAKE_LINT_LOG && ctx->lint_unavailable) {
+        return 0;
+    }
+
     char *file = bake_shell_quote_arg(unit->src);
     char *command = flecs_asprintf("%s %s %s",
         lint->command, file, bake_lint_action_str(action));
@@ -375,7 +383,13 @@ static int bake_lint_single(bake_compile_ctx_t *ctx, const bake_compile_unit_t *
     ecs_os_free(output_path);
 
     if (rc != 0) {
-        return -1;
+        if (action != BAKE_LINT_LOG) {
+            return -1;
+        }
+        if (ecs_os_ainc(&ctx->lint_unavailable) == 1) {
+            ecs_warn("lint command could not be started, skipping lint: %s", lint->command);
+        }
+        return 0;
     }
 
     if (exit_code == 0) {
