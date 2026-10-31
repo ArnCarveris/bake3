@@ -166,8 +166,8 @@ static char* bake_test_coverage_json_path(
     const char *json = NULL;
     for (int i = 0; i < ctx->opts.run_argc; i++) {
         const char *arg = ctx->opts.run_argv[i];
-        bool has_value = !strcmp(arg, "--json") || !strcmp(arg, "-j") ||
-            !strcmp(arg, "--timeout") || !strcmp(arg, "--param");
+        bool has_value = !strcmp(arg, "--json") || !strcmp(arg, "--events") ||
+            !strcmp(arg, "-j") || !strcmp(arg, "--timeout") || !strcmp(arg, "--param");
         if (!has_value || (i + 1) >= ctx->opts.run_argc) {
             continue;
         }

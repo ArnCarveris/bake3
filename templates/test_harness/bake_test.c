@@ -40,6 +40,7 @@ static char **g_failed_tests = NULL;
 static int g_failed_test_count = 0;
 static int g_failed_test_cap = 0;
 static const char *g_json_path = NULL;
+static FILE *g_events = NULL;
 static double g_cli_timeout = 0;
 static bool g_cli_timeout_set = false;
 static int g_timeout_count = 0;
@@ -257,9 +258,9 @@ static void bake_record_result(
     bake_failed_unlock();
 }
 
-static void bake_json_string(FILE *f, const char *str) {
+static void bake_json_string_n(FILE *f, const char *str, size_t size) {
     fputc('"', f);
-    for (const char *p = str ? str : ""; *p; p++) {
+    for (const char *p = str, *end = str + size; p < end; p++) {
         if (*p == '"' || *p == '\\') {
             fputc('\\', f);
             fputc(*p, f);
@@ -270,6 +271,72 @@ static void bake_json_string(FILE *f, const char *str) {
         }
     }
     fputc('"', f);
+}
+
+static void bake_json_string(FILE *f, const char *str) {
+    str = str ? str : "";
+    bake_json_string_n(f, str, strlen(str));
+}
+
+/* The status a case run ends with, as the json report and the event stream name it. */
+static const char* bake_case_status(bool command_ok, bool timed_out, int test_rc) {
+    if (!command_ok) {
+        return "error";
+    }
+    if (timed_out) {
+        return "timeout";
+    }
+    if (test_rc == 0) {
+        return "pass";
+    }
+    if (test_rc == BAKE_TEST_QUARANTINED) {
+        return "quarantined";
+    }
+    if (test_rc == BAKE_TEST_EMPTY) {
+        return "empty";
+    }
+    return "fail";
+}
+
+#define BAKE_EVENT_LOG_MAX (64 * 1024)
+
+/* Writes one line of the --events stream: a case started, or ended with its status,
+ * wall-clock time and output (at most BAKE_EVENT_LOG_MAX bytes of it). Every line is
+ * flushed, so a reader following the file sees each case as it happens. Callers that
+ * run on several threads hold one lock around it. */
+static void bake_write_event(
+    const char *event,
+    const char *suite_id,
+    const char *case_id,
+    const char *param_str,
+    const char *status,
+    double elapsed,
+    const char *log,
+    size_t log_size)
+{
+    if (!g_events) {
+        return;
+    }
+
+    fputs("{\"event\": ", g_events); bake_json_string(g_events, event);
+    fputs(", \"suite\": ", g_events); bake_json_string(g_events, suite_id);
+    fputs(", \"case\": ", g_events); bake_json_string(g_events, case_id);
+    if (param_str && param_str[0]) {
+        fputs(", \"params\": ", g_events); bake_json_string(g_events, param_str);
+    }
+    if (status) {
+        fputs(", \"status\": ", g_events); bake_json_string(g_events, status);
+        fprintf(g_events, ", \"elapsed\": %.6f", elapsed);
+    }
+    if (log && log_size) {
+        size_t size = log_size > BAKE_EVENT_LOG_MAX ? BAKE_EVENT_LOG_MAX : log_size;
+        fputs(", \"log\": ", g_events); bake_json_string_n(g_events, log, size);
+        if (size < log_size) {
+            fputs(", \"truncated\": true", g_events);
+        }
+    }
+    fputs("}\n", g_events);
+    fflush(g_events);
 }
 
 static int bake_write_json_report(
@@ -1071,15 +1138,19 @@ static int bake_run_suite(const char *test_id, const char *exec, bake_test_suite
         if (bake_build_case_command(cmd, sizeof(cmd), exec, suite, &suite->testcases[i], NULL) != 0) {
             fail ++;
             rc = -1;
+            bake_write_event("end", suite->id, suite->testcases[i].id, param_str, "error", 0, NULL, 0);
             bake_record_failure(suite->id, suite->testcases[i].id, param_str, NULL);
             continue;
         }
 
         double timeout = bake_case_timeout(suite);
         bool timed_out = false;
+        bake_write_event("start", suite->id, suite->testcases[i].id, param_str, NULL, 0, NULL, 0);
         double start = bake_time_now();
         int test_rc = bake_run_subprocess(cmd, timeout, &timed_out);
         double elapsed = bake_time_now() - start;
+        bake_write_event("end", suite->id, suite->testcases[i].id, param_str,
+            bake_case_status(true, timed_out, test_rc), elapsed, NULL, 0);
         if (timed_out) {
             fail ++;
             rc = -1;
@@ -1479,12 +1550,19 @@ static void bake_case_worker_run(bake_case_jobs_t *jobs) {
         }
 
         bake_case_job_t *job = &jobs->plan->jobs[job_index];
+        bake_suite_run_t *run = &jobs->plan->runs[job->run_index];
         if (job->command_rc == 0) {
+            bake_jobs_mutex_lock(&jobs->lock);
+            bake_write_event("start", run->suite->id, job->testcase->id, run->param_str,
+                NULL, 0, NULL, 0);
+            bake_jobs_mutex_unlock(&jobs->lock);
             bake_case_job_execute(job);
         }
 
         bake_jobs_mutex_lock(&jobs->lock);
-        bake_suite_run_t *run = &jobs->plan->runs[job->run_index];
+        bake_write_event("end", run->suite->id, job->testcase->id, run->param_str,
+            bake_case_status(job->command_rc == 0, job->timed_out, job->test_rc),
+            job->elapsed, job->output, job->output_size);
         run->done_count ++;
         if (run->done_count == run->job_count) {
             jobs->ready[jobs->ready_count ++] = job->run_index;
@@ -1894,6 +1972,24 @@ int bake_test_run(const char *test_id, int argc, char *argv[], bake_test_suite *
                 continue;
             }
             printf("missing value for --json\n");
+            return -1;
+        }
+        if (!strcmp(arg, "--events")) {
+            if ((i + 1) < argc) {
+#if defined(_WIN32)
+                /* Not inherited, so the case processes never hold the stream open */
+                g_events = fopen(argv[i + 1], "wN");
+#else
+                g_events = fopen(argv[i + 1], "w");
+#endif
+                if (!g_events) {
+                    printf("failed to open event stream '%s': %s\n", argv[i + 1], strerror(errno));
+                    return -1;
+                }
+                i ++;
+                continue;
+            }
+            printf("missing value for --events\n");
             return -1;
         }
 

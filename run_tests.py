@@ -2628,9 +2628,19 @@ class BakeTests(unittest.TestCase):
 
         for jobs in ("1", "3"):
             report = project_dir / f"report_{jobs}.json"
+            events = project_dir / f"events_{jobs}.jsonl"
             self.bake_expect_failure(
-                [local_env, "run", ".", "--", "-j", jobs, "--json", str(report)],
+                [local_env, "run", ".", "--", "-j", jobs, "--json", str(report),
+                 "--events", str(events)],
                 cwd=project_dir)
+            lines = [json.loads(l) for l in events.read_text().splitlines()]
+            starts = {e["case"] for e in lines if e["event"] == "start"}
+            ends = {e["case"]: e for e in lines if e["event"] == "end"}
+            self.assertEqual(starts, {"ok", "bad", "none"})
+            self.assertEqual({c: e["status"] for c, e in ends.items()},
+                             {"ok": "pass", "bad": "fail", "none": "empty"})
+            if jobs == "3":
+                self.assertIn("Alpha.bad", ends["bad"]["log"])
             self.assertTrue(report.is_file(), f"missing report {report}")
             data = json.loads(report.read_text())
             self.assertEqual(data["project"], project_id)

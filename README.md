@@ -695,6 +695,16 @@ The test binary accepts these arguments after `--`:
 - `--timeout <seconds>` overrides the timeout of every case, whatever the suites
   declare. `--timeout 0` disables timeouts. A case that is killed counts as a
   failure, so the run exits non-zero.
+- `--events <path>` writes one json line per case as it starts and as it ends, flushed
+  at once, so another process can follow the run live. An `end` line has the
+  `status` and `elapsed` of the report below; with `-j` it also has the case's
+  output as `log` (at most 64 KB, then `"truncated": true`):
+
+```json
+{"event": "start", "suite": "Entity", "case": "new"}
+{"event": "end", "suite": "Entity", "case": "new", "status": "pass", "elapsed": 0.004, "log": "..."}
+```
+
 - `--json <path>` writes a report with the outcome and wall-clock time of every case:
 
 ```sh
