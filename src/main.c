@@ -59,6 +59,7 @@ int main(int argc, char *argv[]) {
         BFLAG("--strict", strict)
         BFLAG("--coverage", coverage)
         BFLAG("--coverage-summary", coverage_summary)
+        BFLAG("--test-report-failure-only", test_report_failure_only)
         BFLAG("--fix-lint", fix_lint)
         BFLAG("--trace", trace)
         BFLAG("--local", setup_local)
@@ -289,6 +290,16 @@ int main(int argc, char *argv[]) {
                 "--coverage-summary require --coverage for the %s command", cmd);
             goto cleanup;
         }
+    }
+
+    if (opts.test_report_failure_only) {
+        const char *cmd = opts.command ? opts.command : "build";
+        if (!runall && strcmp(cmd, "run") && strcmp(cmd, "test")) {
+            ecs_err("--test-report-failure-only can only be used with the run, "
+                "test and runall commands");
+            goto cleanup;
+        }
+        bake_os_setenv("BAKE_TEST_REPORT_FAILURE_ONLY", "1");
     }
 
     if (bake_settings_load() != 0) {

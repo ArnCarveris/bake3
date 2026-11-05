@@ -159,6 +159,7 @@ Options:
   --coverage-include <patterns> Only report files matching a comma separated prefix or glob
   --coverage-exclude <patterns> Leave out files matching a comma separated prefix or glob
   --coverage-summary  Leave uncovered lines and functions out of coverage json reports
+  --test-report-failure-only Only add failed cases to the test harness --json report
   --fix-lint          Run the lint command of projects with the autofix action
   --trace             Enable trace logging (Flecs log level 0)
   -j <count>          Number of parallel jobs for build/test execution
@@ -810,6 +811,14 @@ how many of those were killed by the timeout.
 bake3 run test/core --local-env -- -j 12 --json /tmp/baseline.json
 # ... change the code ...
 bake3 run test/core --local-env -- -j 12 --ignore /tmp/baseline.json
+```
+
+- `--test-report-failure-only` is a bake option (it goes before `--`) that
+  leaves every case that did not fail out of the `--json` report. The counts
+  still include every case. Such a report is a smaller `--ignore` baseline:
+
+```sh
+bake3 run test/core --local-env --test-report-failure-only -- -j 12 --json /tmp/baseline.json
 ```
 
 ### Coverage
@@ -1470,6 +1479,18 @@ The following settings are supported:
 - `colors`: set to `false` to disable colors in bake's log output. Bake also
   sets `NO_COLOR=1` for the processes it starts, so that test and benchmark
   harnesses print without colors as well. Defaults to `true`.
+- `test.log`: what the test harness prints, with the booleans `pass`, `skip`
+  and `fail`, which default to `true`. `pass` is the output of passing cases
+  and the summary line of suites without failures, `skip` is quarantined and
+  empty cases, and `fail` is failed, crashed and timed out cases with their
+  output, debug commands and the list of failed cases. The summary line of all
+  suites is always printed:
+
+```json
+{
+    "test": {"log": {"pass": false, "skip": false, "fail": true}}
+}
+```
 
 `output_dir` is expanded per project with the `${...}` syntax that `project.json`
 uses for conditional keys:

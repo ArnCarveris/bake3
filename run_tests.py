@@ -2850,6 +2850,138 @@ class BakeTests(unittest.TestCase):
                 self.assertEqual(t["suite"], "Alpha")
                 self.assertGreater(t["elapsed"], 0.0)
 
+    def test_test_harness_report_failure_only(self) -> None:
+        stamp = int(time.time() * 1_000_000)
+        project_id = f"tmp.tests.harness.failonly.{stamp}"
+        project_dir = self.repo_root / "test" / "tmp" / f"harness_failonly_{stamp}"
+        self.addCleanup(shutil.rmtree, project_dir, ignore_errors=True)
+        src_dir = project_dir / "src"
+        src_dir.mkdir(parents=True, exist_ok=True)
+
+        (project_dir / "project.json").write_text(
+            json.dumps(
+                {
+                    "id": project_id,
+                    "type": "test",
+                    "test": {
+                        "testsuites": [
+                            {"id": "Alpha", "testcases": ["ok", "bad", "none"]},
+                        ]
+                    },
+                },
+                indent=4,
+            ) + "\n"
+        )
+        (src_dir / "Alpha.c").write_text(
+            "#include <bake_test.h>\n"
+            "void Alpha_ok(void) { test_assert(true); }\n"
+            "void Alpha_bad(void) { test_assert(false); }\n"
+            "void Alpha_none(void) { }\n"
+        )
+
+        local_env = "--local-env=failonly_report"
+        self.bake([local_env, "build", "."], cwd=project_dir)
+
+        for jobs in ("1", "3"):
+            report = project_dir / f"report_{jobs}.json"
+            self.bake_expect_failure(
+                [local_env, "--test-report-failure-only", "run", ".", "--",
+                 "-j", jobs, "--json", str(report)],
+                cwd=project_dir)
+            data = json.loads(report.read_text())
+            self.assertEqual(data["pass"], 1)
+            self.assertEqual(data["fail"], 1)
+            self.assertEqual(data["empty"], 1)
+            self.assertEqual([t["case"] for t in data["tests"]], ["bad"])
+            self.assertEqual(data["tests"][0]["status"], "fail")
+
+            output = self.bake(
+                [local_env, "run", ".", "--", "-j", jobs, "--ignore", str(report)],
+                cwd=project_dir)
+            self.assertIn("Alpha.bad (already failing)", output)
+
+        output = self.bake_expect_failure(
+            [local_env, "--test-report-failure-only", "build", "."], cwd=project_dir)
+        self.assertIn("--test-report-failure-only can only be used", output)
+
+    def test_test_log_setting_filters_harness_output(self) -> None:
+        settings = self.bake_home / "bake.json"
+        self.addCleanup(settings.unlink, missing_ok=True)
+        stamp = int(time.time() * 1_000_000)
+        project_id = f"tmp.tests.harness.log.{stamp}"
+        project_dir = self.repo_root / "test" / "tmp" / f"harness_log_{stamp}"
+        self.addCleanup(shutil.rmtree, project_dir, ignore_errors=True)
+        src_dir = project_dir / "src"
+        src_dir.mkdir(parents=True, exist_ok=True)
+
+        (project_dir / "project.json").write_text(
+            json.dumps(
+                {
+                    "id": project_id,
+                    "type": "test",
+                    "test": {
+                        "testsuites": [
+                            {"id": "Good", "testcases": ["ok"]},
+                            {"id": "Alpha", "testcases": ["ok", "bad", "none", "skipped"]},
+                        ]
+                    },
+                },
+                indent=4,
+            ) + "\n"
+        )
+        (src_dir / "Good.c").write_text(
+            "#include <bake_test.h>\n"
+            "#include <stdio.h>\n"
+            "void Good_ok(void) { printf(\"good output\\n\"); test_assert(true); }\n"
+        )
+        (src_dir / "Alpha.c").write_text(
+            "#include <bake_test.h>\n"
+            "void Alpha_ok(void) { test_assert(true); }\n"
+            "void Alpha_bad(void) { test_assert(false); }\n"
+            "void Alpha_none(void) { }\n"
+            "void Alpha_skipped(void) { test_quarantine(\"1 Jan 2026\"); }\n"
+        )
+
+        local_env = "--local-env=log_setting"
+        self.bake([local_env, "build", "."], cwd=project_dir)
+
+        for jobs in ("1", "3"):
+            output = self.bake_expect_failure(
+                [local_env, "run", ".", "--", "-j", jobs], cwd=project_dir)
+            self.assertIn("good output", output)
+            self.assertIn(f"({project_id}.Good)", output)
+            self.assertIn("EMPTY Alpha.none", output)
+            self.assertIn("SKIP: Alpha.skipped", output)
+            self.assertIn("FAIL: Alpha.bad", output)
+
+        settings.write_text(json.dumps(
+            {"test": {"log": {"pass": False, "skip": False, "fail": True}}}) + "\n")
+        for jobs in ("1", "3"):
+            output = self.bake_expect_failure(
+                [local_env, "run", ".", "--", "-j", jobs], cwd=project_dir)
+            self.assertNotIn("good output", output)
+            self.assertNotIn(f"({project_id}.Good)", output)
+            self.assertNotIn("EMPTY Alpha.none", output)
+            self.assertNotIn("SKIP: Alpha.skipped", output)
+            self.assertIn("FAIL: Alpha.bad", output)
+            self.assertIn(f"({project_id}.Alpha)", output)
+            self.assertIn(f"({project_id}.all)", output)
+            self.assertIn("1 test case failed", output)
+
+        settings.write_text(json.dumps(
+            {"test": {"log": {"pass": False, "skip": True, "fail": False}}}) + "\n")
+        output = self.bake_expect_failure(
+            [local_env, "run", ".", "--", "-j", "3"], cwd=project_dir)
+        self.assertIn("EMPTY Alpha.none", output)
+        self.assertIn("SKIP: Alpha.skipped", output)
+        self.assertNotIn("FAIL: Alpha.bad", output)
+        self.assertNotIn("test case failed", output)
+
+        settings.write_text(json.dumps({"test": {"log": {"fail": "no"}}}) + "\n")
+        output = self.bake_expect_failure([local_env, "build", "."], cwd=project_dir)
+        self.assertIn("test.log.fail in", output)
+        self.assertIn("must be a boolean", output)
+
     def test_test_harness_ignores_failures_in_report(self) -> None:
         stamp = int(time.time() * 1_000_000)
         project_id = f"tmp.tests.harness.ignore.{stamp}"

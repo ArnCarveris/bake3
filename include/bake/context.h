@@ -30,6 +30,7 @@ typedef struct bake_options_t {
     bool strict;
     bool coverage;
     bool coverage_summary;
+    bool test_report_failure_only;
     bool fix_lint;
     bool trace;
     bool setup_local;

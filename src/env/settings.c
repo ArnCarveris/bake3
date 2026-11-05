@@ -11,6 +11,11 @@ static char *bake_settings_output_dir_value = NULL;
 static char *bake_settings_base_dir = NULL;
 static bool bake_settings_colors_value = true;
 
+static const char *bake_settings_test_log_kinds[] = { "pass", "skip", "fail" };
+static const char *bake_settings_test_log_envs[] = {
+    "BAKE_TEST_LOG_PASS", "BAKE_TEST_LOG_SKIP", "BAKE_TEST_LOG_FAIL"
+};
+
 typedef struct bake_settings_expr_ctx_t {
     const char *id;
     bool used_id;
@@ -168,6 +173,57 @@ bool bake_settings_colors(void) {
     return bake_settings_colors_value;
 }
 
+static int bake_settings_parse_test(
+    JSON_Value *value,
+    const char *path,
+    int *log_out)
+{
+    const JSON_Object *test = json_value_get_object(value);
+    if (!test) {
+        ecs_err("test in %s must be an object", path);
+        return -1;
+    }
+
+    size_t count = json_object_get_count(test);
+    for (size_t i = 0; i < count; i++) {
+        const char *key = json_object_get_name(test, i);
+        JSON_Value *member = json_object_get_value_at(test, i);
+        if (strcmp(key, "log")) {
+            ecs_warn("unknown setting 'test.%s' in %s", key, path);
+            continue;
+        }
+
+        const JSON_Object *log = json_value_get_object(member);
+        if (!log) {
+            ecs_err("test.log in %s must be an object", path);
+            return -1;
+        }
+
+        size_t log_count = json_object_get_count(log);
+        for (size_t l = 0; l < log_count; l++) {
+            const char *kind = json_object_get_name(log, l);
+            JSON_Value *flag = json_object_get_value_at(log, l);
+            int index = -1;
+            for (int k = 0; k < 3; k++) {
+                if (!strcmp(kind, bake_settings_test_log_kinds[k])) {
+                    index = k;
+                }
+            }
+            if (index < 0) {
+                ecs_warn("unknown setting 'test.log.%s' in %s", kind, path);
+                continue;
+            }
+            if (json_value_get_type(flag) != JSONBoolean) {
+                ecs_err("test.log.%s in %s must be a boolean", kind, path);
+                return -1;
+            }
+            log_out[index] = json_value_get_boolean(flag) ? 1 : 0;
+        }
+    }
+
+    return 0;
+}
+
 char* bake_settings_home(void) {
     const char *local_env = getenv("BAKE_LOCAL_ENV");
     const char *env_home = (local_env && !strcmp(local_env, "1"))
@@ -212,6 +268,7 @@ int bake_settings_load(void) {
 
     const char *output_dir = NULL;
     bool colors = true;
+    int test_log[3] = { -1, -1, -1 };
     size_t count = json_object_get_count(object);
     for (size_t i = 0; i < count; i++) {
         const char *key = json_object_get_name(object, i);
@@ -228,6 +285,10 @@ int bake_settings_load(void) {
                 goto cleanup;
             }
             colors = json_value_get_boolean(value);
+        } else if (!strcmp(key, "test")) {
+            if (bake_settings_parse_test(value, path, test_log) != 0) {
+                goto cleanup;
+            }
         } else {
             ecs_warn("unknown setting '%s' in %s", key, path);
         }
@@ -240,6 +301,12 @@ int bake_settings_load(void) {
 
     if (!colors) {
         bake_settings_set_colors(false);
+    }
+
+    for (int k = 0; k < 3; k++) {
+        if (test_log[k] >= 0) {
+            bake_os_setenv(bake_settings_test_log_envs[k], test_log[k] ? "1" : "0");
+        }
     }
 
     rc = 0;

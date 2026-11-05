@@ -118,6 +118,31 @@ static bool bake_use_colors(void) {
     return enabled;
 }
 
+static bool bake_env_flag(const char *name, bool default_value) {
+    const char *value = getenv(name);
+    if (!value || !value[0]) {
+        return default_value;
+    }
+    return strcmp(value, "0") != 0;
+}
+
+static bool bake_log_pass(void) {
+    return bake_env_flag("BAKE_TEST_LOG_PASS", true);
+}
+
+static bool bake_log_skip(void) {
+    return bake_env_flag("BAKE_TEST_LOG_SKIP", true);
+}
+
+static bool bake_log_fail(void) {
+    return bake_env_flag("BAKE_TEST_LOG_FAIL", true);
+}
+
+static bool bake_status_failed(const char *status) {
+    return status && (!strcmp(status, "fail") || !strcmp(status, "crash") ||
+        !strcmp(status, "timeout") || !strcmp(status, "error"));
+}
+
 static void bake_export_colors(void) {
     if (!bake_use_colors()) {
         return;
@@ -311,6 +336,12 @@ static void bake_record_result(
     double elapsed)
 {
     if (!g_json_path) {
+        return;
+    }
+
+    if (!bake_status_failed(status) &&
+        bake_env_flag("BAKE_TEST_REPORT_FAILURE_ONLY", false))
+    {
         return;
     }
 
@@ -518,8 +549,7 @@ static int bake_ignore_load(const char *path, const char *test_id) {
         }
 
         char *status = bake_json_scan_string(status_key, end);
-        bool failed = status && (!strcmp(status, "fail") || !strcmp(status, "crash") ||
-            !strcmp(status, "timeout") || !strcmp(status, "error"));
+        bool failed = bake_status_failed(status);
         free(status);
         if (!failed) {
             continue;
@@ -564,6 +594,17 @@ static void bake_print_failed_tests(void) {
         return;
     }
 
+    if (!bake_log_fail()) {
+        for (int i = 0; i < g_failed_test_count; i++) {
+            free(g_failed_tests[i]);
+        }
+        free(g_failed_tests);
+        g_failed_tests = NULL;
+        g_failed_test_count = 0;
+        g_failed_test_cap = 0;
+        return;
+    }
+
     printf("\n");
     bake_print_status("FAIL", BAKE_COLOR_RED);
     printf(": %d test case%s failed:\n", g_failed_test_count, g_failed_test_count == 1 ? "" : "s");
@@ -581,6 +622,11 @@ static void bake_print_failed_tests(void) {
 static void bake_print_trace(const char *suite_id, const char *case_id, const char *param_str) {
     printf("RUN %s.%s%s\n", suite_id, case_id, param_str ? param_str : "");
     fflush(stdout);
+}
+
+static bool bake_suite_report_enabled(int fail, int empty) {
+    return bake_log_pass() || (fail && bake_log_fail()) ||
+        (empty && bake_log_skip());
 }
 
 static void bake_print_report(const char *test_id, const char *suite_id, const char *param_str, int pass, int fail, int empty) {
@@ -1421,7 +1467,15 @@ static int bake_report_case_job(
     int *empty)
 {
     const char *case_id = job->testcase->id;
-    if (job->output_size) {
+    bool log_fail = bake_log_fail();
+    bool log_skip = bake_log_skip();
+    bool job_failed = job->command_rc != 0 || job->timed_out ||
+        (job->test_rc != 0 && job->test_rc != BAKE_TEST_QUARANTINED &&
+            job->test_rc != BAKE_TEST_EMPTY);
+    bool job_skipped = !job_failed && job->test_rc != 0;
+    bool log_output = job_failed ? log_fail :
+        (job_skipped ? log_skip : bake_log_pass());
+    if (job->output_size && log_output) {
         fwrite(job->output, 1, job->output_size, stdout);
     }
     bool ignored = bake_ignored(suite->id, case_id, param_str);
@@ -1439,9 +1493,11 @@ static int bake_report_case_job(
         bake_record_result(suite->id, case_id, param_str, "timeout", 0, job->elapsed);
         bake_record_failure(suite->id, case_id, param_str,
             ignored ? "timeout, already failing" : "timeout");
-        bake_print_status("TIMEOUT", BAKE_COLOR_RED);
-        printf(" %s.%s (exceeded %g seconds)\n", suite->id, case_id, job->timeout);
-        bake_print_debug_command(exec, suite, job->testcase);
+        if (log_fail) {
+            bake_print_status("TIMEOUT", BAKE_COLOR_RED);
+            printf(" %s.%s (exceeded %g seconds)\n", suite->id, case_id, job->timeout);
+            bake_print_debug_command(exec, suite, job->testcase);
+        }
         return rc;
     }
 
@@ -1457,9 +1513,11 @@ static int bake_report_case_job(
     if (job->test_rc == BAKE_TEST_EMPTY) {
         (*empty) ++;
         bake_record_result(suite->id, case_id, param_str, "empty", 0, job->elapsed);
-        bake_print_status("EMPTY", BAKE_COLOR_YELLOW);
-        printf(" %s.%s (add test statements)\n", suite->id, case_id);
-        bake_print_debug_command(exec, suite, job->testcase);
+        if (log_skip) {
+            bake_print_status("EMPTY", BAKE_COLOR_YELLOW);
+            printf(" %s.%s (add test statements)\n", suite->id, case_id);
+            bake_print_debug_command(exec, suite, job->testcase);
+        }
         return 0;
     }
 
@@ -1468,8 +1526,10 @@ static int bake_report_case_job(
     if (job->exit.crashed) {
         char crash[256];
         bake_case_crash_describe(crash, sizeof(crash), &job->exit);
-        bake_print_status("CRASH", BAKE_COLOR_RED);
-        printf(" %s.%s (%s)\n", suite->id, case_id, crash);
+        if (log_fail) {
+            bake_print_status("CRASH", BAKE_COLOR_RED);
+            printf(" %s.%s (%s)\n", suite->id, case_id, crash);
+        }
         snprintf(reason, sizeof(reason), "crash, %s", ignored ? "already failing" : crash);
         bake_record_result(suite->id, case_id, param_str, "crash", job->exit.signal, job->elapsed);
     } else {
@@ -1485,7 +1545,9 @@ static int bake_report_case_job(
         bake_record_result(suite->id, case_id, param_str, "fail", 0, job->elapsed);
     }
     bake_record_failure(suite->id, case_id, param_str, reason);
-    bake_print_debug_command(exec, suite, job->testcase);
+    if (log_fail) {
+        bake_print_debug_command(exec, suite, job->testcase);
+    }
     return rc;
 }
 
@@ -1517,9 +1579,11 @@ static int bake_run_suite(const char *test_id, const char *exec, bake_test_suite
         free(job.output);
     }
 
-    bake_print_report(test_id, suite->id, param_str, pass, fail, empty);
-    if (fail || empty) {
-        printf("\n");
+    if (bake_suite_report_enabled(fail, empty)) {
+        bake_print_report(test_id, suite->id, param_str, pass, fail, empty);
+        if (fail || empty) {
+            printf("\n");
+        }
     }
 
     if (pass_out) {
@@ -1918,9 +1982,11 @@ static int bake_parallel_report_run(
         }
     }
 
-    bake_print_report(test_id, suite->id, run->param_str, pass, fail, empty);
-    if (fail || empty) {
-        printf("\n");
+    if (bake_suite_report_enabled(fail, empty)) {
+        bake_print_report(test_id, suite->id, run->param_str, pass, fail, empty);
+        if (fail || empty) {
+            printf("\n");
+        }
     }
     fflush(stdout);
     *pass_out += pass;
