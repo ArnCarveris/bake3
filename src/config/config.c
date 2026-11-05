@@ -994,15 +994,15 @@ static int bake_parse_project_cfg_object(
             }
         }
 
-        JSON_Value *rules_value = json_object_get_value(object, "rules");
-        if (rules_value) {
-            if (json_value_get_type(rules_value) != JSONArray) {
-                return -1;
-            }
-            if (bake_parse_rules(json_value_get_array(rules_value), &cfg->rules) != 0) return -1;
-        }
-
         if (bake_parse_lint(object, &cfg->lint) != 0) return -1;
+    }
+
+    JSON_Value *rules_value = json_object_get_value(object, "rules");
+    if (rules_value) {
+        if (json_value_get_type(rules_value) != JSONArray) {
+            return -1;
+        }
+        if (bake_parse_rules(json_value_get_array(rules_value), &cfg->rules) != 0) return -1;
     }
 
     if (bake_parse_project_value_cfg(object, cfg) != 0) return -1;

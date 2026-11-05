@@ -6358,6 +6358,37 @@ class BakeTests(unittest.TestCase):
 
         self.bake(["build", str(project_dir)])
 
+    @unittest.skipIf(platform.system() == "Windows", "rule commands use POSIX shell redirection")
+    def test_conditional_os_block_rules_apply(self) -> None:
+        host_os = platform.system()
+        other_os = "Linux" if host_os == "Darwin" else "Darwin"
+        project_dir, app_id = self.write_simple_app_project(
+            "cond_rules",
+            "int main(void) {\n"
+            "    return 0;\n"
+            "}\n",
+        )
+        (project_dir / "gen.condrule").write_text("")
+        (project_dir / "project.json").write_text(
+            "{\n"
+            f'    "id": "{app_id}",\n'
+            '    "type": "application",\n'
+            '    "rules": [{ "ext": ".condrule", "command": "echo hit > {project}/root_rule.txt" }],\n'
+            f'    "${{os {host_os}}}": {{\n'
+            '        "rules": [{ "ext": ".condrule", "command": "echo hit > {project}/host_rule.txt" }]\n'
+            "    },\n"
+            f'    "${{os {other_os}}}": {{\n'
+            '        "rules": [{ "ext": ".condrule", "command": "echo hit > {project}/other_rule.txt" }]\n'
+            "    }\n"
+            "}\n"
+        )
+
+        self.bake(["build", str(project_dir)])
+
+        self.assertTrue((project_dir / "root_rule.txt").exists())
+        self.assertTrue((project_dir / "host_rule.txt").exists())
+        self.assertFalse((project_dir / "other_rule.txt").exists())
+
     @unittest.skipIf(platform.system() == "Windows", "run-prefix test uses a POSIX shell script")
     def test_run_prefix_wraps_executed_command(self) -> None:
         project_dir, app_id = self.write_simple_app_project(
