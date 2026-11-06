@@ -618,7 +618,7 @@ static void bake_ps_collect_registry(
         const bake_proc_info_t *proc = have_procs ?
             bake_ps_find_proc(procs, proc_count, pid) : NULL;
 
-        bool alive = have_procs ? proc != NULL : bake_os_pid_alive(pid);
+        bool alive = proc != NULL || bake_os_pid_alive(pid);
         if (alive && proc && !bake_ps_cmd_matches(cmd, proc->cmd)) {
             alive = false;
         }

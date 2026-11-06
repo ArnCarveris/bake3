@@ -59,6 +59,50 @@ bake_compiler_kind_t bake_detect_compiler_kind(const char *cc, const char *cxx) 
     return BAKE_COMPILER_UNKNOWN;
 }
 
+char* bake_compiler_capture(
+    const bake_context_t *ctx,
+    const char *const *argv)
+{
+    char *name = flecs_asprintf(".bake_compiler_probe_%lld",
+        (long long)bake_os_pid());
+    char *stdout_path = bake_path_join(ctx->bake_home, name);
+    ecs_os_free(name);
+
+    bake_process_stdio_t stdio_cfg = {
+        .stdout_path = stdout_path,
+        .stderr_to_stdout = true
+    };
+    bake_process_result_t result = {0};
+    char *output = NULL;
+    if (bake_proc_run(argv, &stdio_cfg, &result) == 0 &&
+        result.exit_code == 0)
+    {
+        output = bake_file_read_trimmed(stdout_path);
+    }
+
+    bake_remove_file_if_exists(stdout_path);
+    ecs_os_free(stdout_path);
+    return output;
+}
+
+bake_compiler_kind_t bake_resolve_compiler_kind(const bake_context_t *ctx) {
+    const char *cc = ctx->opts.cc;
+    const char *cxx = ctx->opts.cxx;
+    bake_compiler_kind_t kind = bake_detect_compiler_kind(cc, cxx);
+    if (kind != BAKE_COMPILER_GCC) {
+        return kind;
+    }
+
+    const char *probe = cxx && cxx[0] ? cxx : (cc ? cc : "cc");
+    const char *argv[] = { probe, "--version", NULL };
+    char *version = bake_compiler_capture(ctx, argv);
+    if (version && strstr(version, "clang")) {
+        kind = BAKE_COMPILER_CLANG;
+    }
+    ecs_os_free(version);
+    return kind;
+}
+
 void bake_add_mode_flags(const char *mode, bake_compiler_kind_t kind, bake_strlist_t *cflags, bake_strlist_t *cxxflags, bake_strlist_t *ldflags) {
     static const char *msvc_debug[] = {"/Zi", "/Od", NULL};
     static const char *msvc_release[] = {"/O2", "/GL", NULL};
@@ -68,6 +112,8 @@ void bake_add_mode_flags(const char *mode, bake_compiler_kind_t kind, bake_strli
     static const char *gnu_debug[] = {"-g", "-O0", NULL};
     static const char *gnu_release[] = {"-O3", "-DNDEBUG", "-flto", NULL};
     static const char *gnu_release_ld[] = {"-flto", NULL};
+    static const char *clang_release[] = {"-O3", "-DNDEBUG", "-flto=thin", NULL};
+    static const char *clang_release_ld[] = {"-flto=thin", NULL};
     static const char *gnu_profile[] = {"-O2", "-pg", NULL};
     static const char *gnu_sanitize[] = {
         "-O0", "-g", "-fsanitize=address", "-fsanitize=undefined", NULL
@@ -103,9 +149,15 @@ void bake_add_mode_flags(const char *mode, bake_compiler_kind_t kind, bake_strli
         if (kind == BAKE_COMPILER_MSVC) {
             bake_append_lang_flags(cflags, cxxflags, msvc_release);
             bake_append_flags(ldflags, msvc_release_ld);
+        } else if (is_em) {
+            bake_append_lang_flags(cflags, cxxflags, gnu_release);
+            bake_append_flags(ldflags, em_release_ld);
+        } else if (kind == BAKE_COMPILER_CLANG) {
+            bake_append_lang_flags(cflags, cxxflags, clang_release);
+            bake_append_flags(ldflags, clang_release_ld);
         } else {
             bake_append_lang_flags(cflags, cxxflags, gnu_release);
-            bake_append_flags(ldflags, is_em ? em_release_ld : gnu_release_ld);
+            bake_append_flags(ldflags, gnu_release_ld);
         }
         return;
     }

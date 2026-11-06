@@ -1226,7 +1226,7 @@ static int bake_prepare_discovery(bake_context_t *ctx, char **target_path_out) {
         goto cleanup;
     }
 
-    ctx->compiler_kind = bake_detect_compiler_kind(ctx->opts.cc, ctx->opts.cxx);
+    ctx->compiler_kind = bake_resolve_compiler_kind(ctx);
     if (bake_coverage_prepare(ctx) != 0) {
         goto cleanup;
     }

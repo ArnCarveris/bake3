@@ -293,9 +293,21 @@ static void test_mode_flags_native(void) {
     bake_strlist_t cflags, ldflags;
 
     mode_flags("release", &cflags, &ldflags);
-    CHECK(strlist_has(&ldflags, "-flto"));
+    CHECK(strlist_has(&cflags, "-flto=thin"));
+    CHECK(strlist_has(&ldflags, "-flto=thin"));
+    CHECK(!strlist_has(&ldflags, "-flto"));
     CHECK(!strlist_has(&ldflags, "-O3"));
     bake_strlist_fini(&cflags); bake_strlist_fini(&ldflags);
+
+    bake_strlist_t cxxflags;
+    bake_strlist_init(&cflags);
+    bake_strlist_init(&cxxflags);
+    bake_strlist_init(&ldflags);
+    bake_add_mode_flags("release", BAKE_COMPILER_GCC, &cflags, &cxxflags, &ldflags);
+    CHECK(strlist_has(&cflags, "-flto"));
+    CHECK(strlist_has(&ldflags, "-flto"));
+    CHECK(!strlist_has(&ldflags, "-flto=thin"));
+    bake_strlist_fini(&cflags); bake_strlist_fini(&cxxflags); bake_strlist_fini(&ldflags);
 
     mode_flags("debug", &cflags, &ldflags);
     CHECK(ldflags.count == 0);

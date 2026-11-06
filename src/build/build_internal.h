@@ -64,6 +64,8 @@ int bake_apply_dependee_cfg(
 int32_t bake_em_serve_first_port(int32_t requested);
 
 bake_compiler_kind_t bake_detect_compiler_kind(const char *cc, const char *cxx);
+bake_compiler_kind_t bake_resolve_compiler_kind(const bake_context_t *ctx);
+char* bake_compiler_capture(const bake_context_t *ctx, const char *const *argv);
 void bake_add_mode_flags(const char *mode, bake_compiler_kind_t kind, bake_strlist_t *cflags, bake_strlist_t *cxxflags, bake_strlist_t *ldflags);
 void bake_add_strict_flags(bool strict, bake_compiler_kind_t kind, bake_strlist_t *cflags, bake_strlist_t *cxxflags, bake_strlist_t *ldflags);
 char* bake_coverage_tool(const bake_context_t *ctx, const char *tool);

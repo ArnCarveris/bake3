@@ -6,36 +6,10 @@ static const char* bake_coverage_cc(const bake_context_t *ctx) {
     return ctx->opts.cc ? ctx->opts.cc : "cc";
 }
 
-static char* bake_coverage_capture(
-    const bake_context_t *ctx,
-    const char *const *argv)
-{
-    char *name = flecs_asprintf(".bake_coverage_probe_%lld",
-        (long long)bake_os_pid());
-    char *stdout_path = bake_path_join(ctx->bake_home, name);
-    ecs_os_free(name);
-
-    bake_process_stdio_t stdio_cfg = {
-        .stdout_path = stdout_path,
-        .stderr_to_stdout = true
-    };
-    bake_process_result_t result = {0};
-    char *output = NULL;
-    if (bake_proc_run(argv, &stdio_cfg, &result) == 0 &&
-        result.exit_code == 0)
-    {
-        output = bake_file_read_trimmed(stdout_path);
-    }
-
-    bake_remove_file_if_exists(stdout_path);
-    ecs_os_free(stdout_path);
-    return output;
-}
-
 char* bake_coverage_tool(const bake_context_t *ctx, const char *tool) {
     char *arg = flecs_asprintf("-print-prog-name=%s", tool);
     const char *argv[] = { bake_coverage_cc(ctx), arg, NULL };
-    char *path = bake_coverage_capture(ctx, argv);
+    char *path = bake_compiler_capture(ctx, argv);
     ecs_os_free(arg);
     if (!path || !path[0]) {
         ecs_os_free(path);
@@ -59,15 +33,7 @@ int bake_coverage_init_tools(bake_context_t *ctx) {
     }
 
     const char *cc = bake_coverage_cc(ctx);
-    bool is_clang = ctx->compiler_kind == BAKE_COMPILER_CLANG;
-    if (!is_clang && ctx->compiler_kind != BAKE_COMPILER_MSVC) {
-        const char *argv[] = { cc, "--version", NULL };
-        char *version = bake_coverage_capture(ctx, argv);
-        is_clang = version && strstr(version, "clang");
-        ecs_os_free(version);
-    }
-
-    if (!is_clang) {
+    if (ctx->compiler_kind != BAKE_COMPILER_CLANG) {
         ecs_err("--coverage requires clang, '%s' is not clang "
             "(use --cc clang --cxx clang++)", cc);
         return -1;
